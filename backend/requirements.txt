@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-dotenv
+requests
+boto3
+qdrant-client
+python-multipart
+fastembed
+onnxruntime
+Pillow
+redis
