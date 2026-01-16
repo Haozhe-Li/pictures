@@ -128,8 +128,10 @@ async def ingest_image(
         temp_filename_preview = f"/tmp/{storage_filename_preview}"
         temp_filename_original = f"/tmp/{storage_filename_original}"
 
-        # 1.1 Save Preview (Quality 10)
-        await run_in_threadpool(save_as_webp, file_bytes, temp_filename_preview, 5)
+        # 1.1 Save Preview (Quality 10) with lower resolution
+        await run_in_threadpool(
+            save_as_webp, file_bytes, temp_filename_preview, 5, max_size=2000
+        )
 
         # 1.2 Save Original (Quality 90)
         await run_in_threadpool(save_as_webp, file_bytes, temp_filename_original, 60)

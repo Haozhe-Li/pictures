@@ -35,11 +35,21 @@ def process_image_for_embedding(file_bytes: bytes, max_size: int = 1024) -> str:
         raise ValueError(f"Failed to process image for embedding: {e}")
 
 
-def save_as_webp(file_bytes: bytes, output_path: str, quality: int = 50) -> None:
+def save_as_webp(
+    file_bytes: bytes,
+    output_path: str,
+    quality: int = 50,
+    max_size: int | None = None,
+) -> None:
     """
     Compresses image to WebP and saves to the specified path.
+    Optionally downscales to max_size (longer edge).
     """
     image = Image.open(io.BytesIO(file_bytes))
+
+    # Resize if dimensions exceed max_size (maintaining aspect ratio)
+    if max_size and max(image.size) > max_size:
+        image.thumbnail((max_size, max_size))
 
     # Ensure compatible mode for WebP (RGB or RGBA)
     if image.mode not in ("RGB", "RGBA"):
