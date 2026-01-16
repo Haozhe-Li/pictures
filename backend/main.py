@@ -32,6 +32,21 @@ redis_client = redis.Redis(
 )
 
 
+# async def invalidate_gallery_cache() -> None:
+#     """
+#     Remove cached gallery pages after new uploads.
+#     """
+#     try:
+#         keys = []
+#         async for key in redis_client.scan_iter(match="gallery:*"):
+#             keys.append(key)
+
+#         if keys:
+#             await redis_client.delete(*keys)
+#     except Exception as e:
+#         print(f"Warning: Failed to invalidate gallery cache: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Initialize Qdrant Collection
@@ -214,6 +229,8 @@ async def ingest_image(
             payload=payload,
         )
 
+        await invalidate_gallery_cache()
+
         return {
             "status": "success",
             "id": point_id,
@@ -333,6 +350,7 @@ async def get_gallery(limit: int = 20, cursor: Optional[str] = None):
     """
     Get all images in a gallery view with pagination.
     """
+
     try:
         # 1. Try Cache
         cache_key = f"gallery:{limit}:{cursor}"
