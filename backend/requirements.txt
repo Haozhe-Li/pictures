@@ -9,3 +9,4 @@ fastembed
 onnxruntime
 Pillow
 redis
+langchain-groq

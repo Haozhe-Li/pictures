@@ -8,6 +8,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
+from core.random_query import generate_random_query
 import secrets
 import json
 import redis.asyncio as redis
@@ -364,6 +365,18 @@ async def get_gallery(limit: int = 20, cursor: Optional[str] = None):
         )  # TTL 5 minutes
 
         return response
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/generate-random-query")
+async def generate_random_query_endpoint():
+    """
+    Generate a random photo description query using LLM.
+    """
+    try:
+        query = await generate_random_query()
+        return {"query": query}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
