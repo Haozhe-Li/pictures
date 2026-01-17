@@ -11,8 +11,8 @@ async def generate_random_query() -> str:
     messages = [
         (
             "system",
-            """Generate one concise, vivid photo description (5–12 words). Output only the description with no extra text.
-Example: Star gazing in the mountains at night.""",
+            """Generate one concise, vivid photo description (<5 words). Output only the description with no extra text.
+Example: Star gazing""",
         ),
     ]
     ai_msg = await llm.ainvoke(messages)
