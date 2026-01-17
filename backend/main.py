@@ -399,6 +399,14 @@ async def generate_random_query_endpoint():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint.
+    """
+    return {"status": "ok"}
+
+
 if __name__ == "__main__":
     import uvicorn
 
