@@ -6,6 +6,8 @@
 
 [![Live Demo](https://img.shields.io/badge/🌐_Live_Demo-haozheli.pictures-blue?style=for-the-badge)](https://www.haozheli.pictures/)
 
+[English](README.md) | [简体中文](README_ZH.md)
+
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)
 ![Next.js](https://img.shields.io/badge/Next.js-14-000000?style=flat-square&logo=next.js&logoColor=white)
@@ -359,7 +361,7 @@ This project is currently unlicensed. If you plan to open-source this project, p
 ---
 
 <div align="center">
-**Built with ❤️ by [Haozhe Li](https://www.haozhe.li)**
+**Built with ❤️ by Haozhe Li**
 
 [⬆ Back to Top](#-pictures)
 
