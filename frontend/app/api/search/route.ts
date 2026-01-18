@@ -1,37 +1,18 @@
-import { type NextRequest, NextResponse } from "next/server"
+import { NextResponse } from "next/server"
+import { searchImages } from "@/lib/api"
 
-export const runtime = "nodejs"
-
-const BACKEND_URL = process.env.BACKEND_URL || "http://127.0.0.1:8000"
-
-export async function POST(request: NextRequest) {
+export async function POST(request: Request) {
   try {
-    const body = await request.json()
+    const { query, limit = 20 } = await request.json()
 
-    const response = await fetch(`${BACKEND_URL}/search`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify(body),
-    })
-
-    if (!response.ok) {
-      console.error("Backend search error:", response.status)
-      return NextResponse.json([])
+    if (!query) {
+      return NextResponse.json({ error: "Query is required" }, { status: 400 })
     }
 
-    const contentType = response.headers.get("content-type")
-    if (!contentType || !contentType.includes("application/json")) {
-      console.error("Non-JSON search response from backend")
-      return NextResponse.json([])
-    }
-
-    const data = await response.json()
+    const data = await searchImages(query, limit)
     return NextResponse.json(data)
   } catch (error) {
-    console.error("Search API error:", error)
-    return NextResponse.json([])
+    console.error("Search error:", error)
+    return NextResponse.json({ error: "Failed to search images" }, { status: 500 })
   }
 }

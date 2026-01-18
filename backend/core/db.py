@@ -102,7 +102,7 @@ class QdrantClientWrapper:
                 fusion=models.Fusion.RRF,
             ),
             with_payload=True,
-            # score_threshold=0.3,
+            # score_threshold=0.8,
         )
         return search_result.points
 

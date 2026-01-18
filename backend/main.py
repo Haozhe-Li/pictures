@@ -19,6 +19,7 @@ from core.embedding import JinaClient, get_sparse_embedding
 from core.storage import upload_file_to_r2
 from core.db import QdrantClientWrapper
 from core.utils import process_image_for_embedding, save_as_webp
+from core.generate_description import description_generator
 
 # --- Initialize Clients ---
 jina_client = JinaClient()
@@ -108,6 +109,11 @@ class SearchResult(BaseModel):
 class GalleryResponse(BaseModel):
     items: List[SearchResult]
     next_cursor: Optional[str] = None
+
+
+class GenerateDescriptionResponse(BaseModel):
+    title: str
+    description: str
 
 
 # --- Endpoints ---
@@ -243,6 +249,34 @@ async def ingest_image(
         raise he
     except Exception as e:
         # Cleanup?
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generate-description", response_model=GenerateDescriptionResponse)
+async def generate_description_endpoint(file: UploadFile = File(...)):
+    """
+    Generate title and description for an image using LLM.
+    """
+    try:
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        # Compress/resize before sending to LLM
+        image_base64 = await run_in_threadpool(process_image_for_embedding, file_bytes)
+
+        result = await description_generator.generate(image_base64)
+
+        if not result.get("title") or not result.get("description"):
+            raise HTTPException(
+                status_code=500, detail="LLM response missing title or description"
+            )
+
+        return GenerateDescriptionResponse(**result)
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 

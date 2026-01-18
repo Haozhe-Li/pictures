@@ -1,31 +1,15 @@
 import type React from "react"
 import type { Metadata } from "next"
-
+import { Inter, Playfair_Display } from "next/font/google"
 import { Analytics } from "@vercel/analytics/next"
 import "./globals.css"
 
-import { Inter, Geist_Mono, Source_Serif_4 } from 'next/font/google'
-
-const inter = Inter({
-  subsets: ["latin"],
-  weight: ["100", "200", "300", "400", "500", "600", "700", "800", "900"],
-  variable: "--font-inter",
-})
-const geistMono = Geist_Mono({
-  subsets: ["latin"],
-  weight: ["100", "200", "300", "400", "500", "600", "700", "800", "900"],
-  variable: "--font-geist-mono",
-})
-const sourceSerif4 = Source_Serif_4({
-  subsets: ["latin"],
-  weight: ["200", "300", "400", "500", "600", "700", "800", "900"],
-  variable: "--font-source-serif-4",
-})
+const _inter = Inter({ subsets: ["latin"], variable: "--font-inter" })
+const _playfair = Playfair_Display({ subsets: ["latin"], variable: "--font-playfair" })
 
 export const metadata: Metadata = {
-  title: "Haozhe Li - Visual Collection",
-  description:
-    "Photos and images curated by Haozhe Li. Explore a diverse gallery showcasing moments captured through the lens.",
+  title: "Pictures - Haozhe Li",
+  description: "A curated gallery of photographs by Haozhe Li.",
   icons: {
     icon: [
       {
@@ -49,8 +33,8 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="en" className="dark">
-      <body className={`${inter.variable} ${geistMono.variable} ${sourceSerif4.variable} font-sans antialiased`}>
+    <html lang="en">
+      <body className={`font-sans antialiased`}>
         {children}
         <Analytics />
       </body>

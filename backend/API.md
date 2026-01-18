@@ -136,7 +136,23 @@ Generate a random photo description query using LLM.
   }
   ```
 
-## 6. Health Check
+## 6. Generate Description (Auto Title & Description)
+
+Generate a short title and detailed description for an uploaded image.
+
+- **URL**: `POST /generate-description`
+- **Content-Type**: `multipart/form-data`
+- **Form Data**:
+  - `file`: (File, Required) The image file (jpg/png/webp).
+- **Response Example**:
+  ```json
+  {
+    "title": "海边日落",
+    "description": "画面展示了海边的日落景象，天空被橙红色渲染，远处有低矮的海岸线与零散的人影。照片看起来像是在海滩或海岸步道拍摄，可能位于临海城市或度假区。前景有沙滩或礁石纹理，整体氛围温暖宁静。"
+  }
+  ```
+
+## 7. Health Check
 
 - **URL**: `GET /health`
 - **Response Example**:
