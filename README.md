@@ -18,32 +18,9 @@
 
 ![Homepage Demo](assets/pictures-home.gif)
 
-[Features](#-features) • [Architecture](#-architecture) • [Quick Start](#-quick-start) • [API Docs](backend/API.md) • [Deployment](#-deployment)
+[Features](#-features) • [Architecture](#️-architecture) • [Tech Stack](#️-tech-stack) • [Quick Start](#-quick-start) • [Configuration](#️-configuration) • [Deployment](#-deployment)
 
 </div>
-
----
-
-## 📑 Table of Contents
-
-- [✨ Features](#-features)
-- [🏗️ Architecture](#️-architecture)
-  - [Hybrid Retrieval](#hybrid-retrieval)
-  - [Multi-Layer Caching](#multi-layer-caching)
-- [🛠️ Tech Stack](#️-tech-stack)
-- [📂 Project Structure](#-project-structure)
-- [🚀 Quick Start](#-quick-start)
-  - [Prerequisites](#prerequisites)
-  - [Backend Setup](#backend-setup)
-  - [Frontend Setup](#frontend-setup)
-  - [Upload GUI Setup](#upload-gui-setup)
-- [⚙️ Configuration](#️-configuration)
-  - [Backend Environment Variables](#backend-environment-variables)
-  - [Frontend Environment Variables](#frontend-environment-variables)
-  - [Upload GUI Environment Variables](#upload-gui-environment-variables)
-- [📚 API Documentation](#-api-documentation)
-- [🚢 Deployment](#-deployment)
-- [📄 License](#-license)
 
 ---
 
@@ -382,8 +359,7 @@ This project is currently unlicensed. If you plan to open-source this project, p
 ---
 
 <div align="center">
-
-**Built with ❤️ by [Haozhe Li](https://www.haozheli.pictures/)**
+**Built with ❤️ by [Haozhe Li](https://www.haozhe.li)**
 
 [⬆ Back to Top](#-pictures)
 
