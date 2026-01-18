@@ -229,7 +229,7 @@ async def ingest_image(
             payload=payload,
         )
 
-        await invalidate_gallery_cache()
+        # await invalidate_gallery_cache()
 
         return {
             "status": "success",
