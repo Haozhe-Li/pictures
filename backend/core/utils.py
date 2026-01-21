@@ -39,7 +39,7 @@ def save_as_webp(
     file_bytes: bytes,
     output_path: str,
     quality: int = 50,
-    max_size: int | None = None,
+    max_size: int = 3000,
 ) -> None:
     """
     Compresses image to WebP and saves to the specified path.

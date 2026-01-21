@@ -161,3 +161,34 @@ Generate a short title and detailed description for an uploaded image.
     "status": "ok"
   }
   ```
+
+## 8. Autocomplete Suggestions
+
+Get search suggestions based on the current input prefix. Supports fuzzy matching and phrase completion.
+
+- **URL**: `GET /autocomplete`
+- **Query Parameters**:
+  - `q` (string, required): The prefix or partial query to autocomplete.
+- **Response Example**:
+  ```json
+  {
+    "suggestions": [
+      "Osaka Castle",
+      "Osaka streets",
+      "Osaka night view"
+    ]
+  }
+  ```
+
+## 9. Build Autocomplete Index
+
+Trigger a rebuild of the autocomplete Trie index from the Qdrant database. This scans all image titles and descriptions and updates the in-memory and on-disk model.
+
+- **URL**: `POST /autocomplete/build`
+- **Response Example**:
+  ```json
+  {
+    "status": "success",
+    "message": "Autocomplete index rebuilt."
+  }
+  ```

@@ -20,6 +20,7 @@ from core.storage import upload_file_to_r2
 from core.db import QdrantClientWrapper
 from core.utils import process_image_for_embedding, save_as_webp
 from core.generate_description import description_generator
+from core.autocomplete import autocomplete_manager
 
 # --- Initialize Clients ---
 jina_client = JinaClient()
@@ -33,27 +34,16 @@ redis_client = redis.Redis(
 )
 
 
-# async def invalidate_gallery_cache() -> None:
-#     """
-#     Remove cached gallery pages after new uploads.
-#     """
-#     try:
-#         keys = []
-#         async for key in redis_client.scan_iter(match="gallery:*"):
-#             keys.append(key)
-
-#         if keys:
-#             await redis_client.delete(*keys)
-#     except Exception as e:
-#         print(f"Warning: Failed to invalidate gallery cache: {e}")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Load autocomplete model if available
+    autocomplete_manager.initialize()
+
     # Startup: Initialize Qdrant Collection
     await qdrant_wrapper.init_collection()
     yield
     await redis_client.close()
+    await qdrant_wrapper.client.close()
 
 
 app = FastAPI(title="Gallery RAG Backend", lifespan=lifespan)
@@ -65,6 +55,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/autocomplete")
+async def autocomplete(q: str):
+    """
+    Get autocomplete suggestions for the given query.
+    """
+    if not q:
+        return {"suggestions": []}
+    
+    suggestions = autocomplete_manager.suggest(q)
+    return {"suggestions": suggestions}
+
+@app.post("/autocomplete/build")
+async def build_autocomplete():
+    """
+    Trigger a rebuild of the autocomplete index from Qdrant data.
+    """
+    await autocomplete_manager.build_index(qdrant_wrapper)
+    return {"status": "success", "message": "Autocomplete index rebuilt."}
 
 
 # --- Security ---
