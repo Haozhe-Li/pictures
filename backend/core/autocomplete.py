@@ -8,6 +8,12 @@ from core.config import settings
 # Define the path for the serialized model
 TRIE_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "trie_model.pkl")
 
+# Define a minimal set of stop words for autocomplete logic
+STOP_WORDS = {
+    "a", "an", "the", "in", "on", "at", "of", "to", "for", 
+    "with", "by", "from", "and", "or", "is", "are", "was", "were"
+}
+
 class AutocompleteManager:
     def __init__(self):
         self.trie = Trie()
@@ -75,6 +81,35 @@ class AutocompleteManager:
         except Exception as e:
             print(f"Failed to save Trie model: {e}")
 
+    def _get_smart_suffix(self, words: list, start_index: int, limit: int = 3) -> str:
+        """
+        Extracts a suffix starting from start_index.
+        Includes at most `limit` significant words (non-stop-words) after the first word.
+        """
+        result = [words[start_index]] # Always keep the matched word
+        significant_count = 0
+        idx = start_index + 1
+        
+        while idx < len(words) and significant_count < limit:
+            word = words[idx]
+            result.append(word)
+            
+            if word not in STOP_WORDS:
+                significant_count += 1
+            
+            idx += 1
+            
+            # Hard limit to prevent runaway strings if everything is a stop word
+            if len(result) > 10: 
+                break
+        
+        # Optional: Trim trailing stop words if we hit the limit?
+        # E.g. "walking in the park and" -> "walking in the park"
+        while len(result) > 1 and result[-1] in STOP_WORDS:
+            result.pop()
+            
+        return " ".join(result)
+
     def _process_and_insert(self, text: str, is_phrase: bool = False):
         # Basic tokenization
         # Remove punctuation and split by whitespace
@@ -93,10 +128,8 @@ class AutocompleteManager:
             word = words[i]
             if len(word) < 2: continue # Skip single chars
             
-            # Construct suffix from this word onwards
-            # Limit suffix length to e.g. 4 words (Matched word + 3 following)
-            suffix_words = words[i : i+4] 
-            suffix_phrase = " ".join(suffix_words)
+            # Construct suffix using smart limit (limit=3 significant words)
+            suffix_phrase = self._get_smart_suffix(words, i, limit=3)
             
             self.trie.insert(word, phrase=suffix_phrase)
 
@@ -137,16 +170,18 @@ class AutocompleteManager:
         prefix = " ".join(parts[:-1])
 
         for s in suggestions:
-            # Restriction 2: Truncate suggestion to max 4 words (Matched + 3 following)
-            # This handles cases where older models might have longer phrases stored
+            # Restriction 2: Re-apply smart truncation in case older models are loaded
+            # or data inconsistency.
             s_parts = s.split()
-            if len(s_parts) > 4:
-                s = " ".join(s_parts[:4])
+            # If the stored phrase is longer than we expect (though we trimmed at insert time),
+            # we can run the smart truncation again effectively.
+            # Reuse logic: treat the whole phrase as "words" starting at 0
+            truncated_s = self._get_smart_suffix(s_parts, 0, limit=3)
             
             if prefix:
-                final_results.append(f"{prefix} {s}")
+                final_results.append(f"{prefix} {truncated_s}")
             else:
-                final_results.append(s)
+                final_results.append(truncated_s)
         
         # Deduplicate and limit
         return list(set(final_results))[:10]
