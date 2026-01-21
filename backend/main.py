@@ -110,6 +110,7 @@ class SimilarToRequest(BaseModel):
 
 
 class SearchResult(BaseModel):
+    id: str
     preview_url: str
     original_url: str
     metadata: dict
@@ -319,6 +320,7 @@ async def search_images(request: SearchRequest):
         for hit in results:
             output.append(
                 SearchResult(
+                    id=str(hit.id),
                     preview_url=hit.payload.get("preview_url", ""),
                     original_url=hit.payload.get("original_url", ""),
                     metadata=hit.payload,
@@ -374,6 +376,7 @@ async def similar_to_image(request: SimilarToRequest):
                 continue
             output.append(
                 SearchResult(
+                    id=str(hit.id),
                     preview_url=hit.payload.get("preview_url", ""),
                     original_url=hit.payload.get("original_url", ""),
                     metadata=hit.payload,
@@ -412,6 +415,7 @@ async def get_gallery(limit: int = 20, cursor: Optional[str] = None):
         for point in points:
             items.append(
                 SearchResult(
+                    id=str(point.id),
                     preview_url=point.payload.get("preview_url", ""),
                     original_url=point.payload.get("original_url", ""),
                     metadata=point.payload,
