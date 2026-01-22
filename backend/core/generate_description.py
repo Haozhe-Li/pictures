@@ -13,7 +13,7 @@ class ImageDescriptionGenerator:
 
     def __init__(self):
         self.client = Groq()
-        self.model = "meta-llama/llama-4-scout-17b-16e-instruct"
+        self.model = "meta-llama/llama-4-maverick-17b-128e-instruct"
 
     async def generate(self, image_base64: str) -> Dict[str, str]:
         return await asyncio.to_thread(self._generate_sync, image_base64)
@@ -27,15 +27,18 @@ class ImageDescriptionGenerator:
                     {
                         "type": "text",
                         "text": (
-                            "You are an image understanding assistant. Generate a title and a description for the provided image.\n\n"
-                            "Requirements:\n"
-                            '1) Output JSON only: {"title":"...","description":"..."}\n'
-                            "2) The title must be very short (2-6 words), summarizing the core content. No punctuation.\n"
-                            "3) The description should be very short and natural (about 6-12 words), e.g., 'Stands on a cliff, overlooking the sea.'\n"
-                            "4) End the description with a location tag in the format: City, Country (e.g., Paris, France).\n"
-                            "5) If the location is in the United States, use City, State (e.g., Yosemite, CA).\n"
-                            "6) The title and description must be in English.\n"
-                            "7) No Markdown, no extra fields, no explanations."
+                            """You are an image understanding assistant. Generate a poetic title and a brief description for the provided image.  
+
+Requirements:  
+1) Output **JSON only** in the format: {"title":"...","description":"..."}  
+2) The **title** should be **very short (2–6 words)**, slightly poetic, and not a literal description of the image. **No punctuation.**  
+3) The **description** should be **one short, poetic sentence**, ending with a location tag in the format “City, Country” (e.g., “Dreamlike mist over quiet hills. Kyoto, Japan”).  
+4) If the location is in the United States, use “City, State” (e.g., “Golden fields beneath the sun. Yosemite, CA”).  
+5) If the image features a famous or recognizable landmark or district, include that in the location tag, formatted as “Landmark, City, Country” (e.g., “Shibuya, Tokyo, Japan”).  
+6) Both title and description must be in **English**.  
+7) No Markdown, no explanations, and no extra fields — only return the JSON output.  
+
+"""
                         ),
                     },
                     {
@@ -49,7 +52,7 @@ class ImageDescriptionGenerator:
         completion = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
-            temperature=0.2,
+            temperature=0.8,
             max_completion_tokens=512,
             top_p=1,
             stream=False,

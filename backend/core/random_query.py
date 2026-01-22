@@ -4,7 +4,7 @@ import os
 
 dotenv.load_dotenv()
 
-llm = ChatGroq(model="llama-3.1-8b-instant", api_key=os.getenv("GROQ_API_KEY"))
+llm = ChatGroq(model="llama-3.1-8b-instant", api_key=os.getenv("GROQ_API_KEY"), temperature=0.9)
 
 
 async def generate_random_query() -> str:
