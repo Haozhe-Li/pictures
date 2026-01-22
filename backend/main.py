@@ -68,6 +68,30 @@ async def autocomplete(q: str):
     suggestions = autocomplete_manager.suggest(q)
     return {"suggestions": suggestions}
 
+@app.get("/image/{image_id}")
+async def get_image_by_id(image_id: str):
+    """
+    Get a single image detail by its ID.
+    """
+    try:
+        point = await qdrant_wrapper.get_point(image_id)
+        if not point:
+            raise HTTPException(status_code=404, detail="Image not found")
+        
+        metadata = point.payload
+        return SearchResult(
+            preview_url=metadata.get("preview_url", ""),
+            original_url=metadata.get("original_url", ""),
+            score=1.0,  # Exact match by ID
+            metadata=metadata,
+            id=image_id,
+        )
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        print(f"Error fetching image {image_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 @app.post("/autocomplete/build")
 async def build_autocomplete():
     """

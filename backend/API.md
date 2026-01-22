@@ -166,7 +166,7 @@ Generate a short title and detailed description for an uploaded image.
 
 Get search suggestions based on the current input prefix. Supports fuzzy matching and phrase completion.
 
-- **URL**: `GET /autocomplete`
+- **URL**: `GET /api/autocomplete`
 - **Query Parameters**:
   - `q` (string, required): The prefix or partial query to autocomplete.
 - **Response Example**:
@@ -190,5 +190,30 @@ Trigger a rebuild of the autocomplete Trie index from the Qdrant database. This 
   {
     "status": "success",
     "message": "Autocomplete index rebuilt."
+  }
+  ```
+
+## 10. Get Image by ID
+
+Get details for a specific image by its UUID.
+
+- **URL**: `GET /image/{image_id}`
+- **Path Parameters**:
+  - `image_id` (string, required): The UUID of the image to retrieve.
+- **Response Example**:
+  ```json
+  {
+    "preview_url": "https://cdn.haozheli.com/uuid_preview.webp",
+    "original_url": "https://cdn.haozheli.com/uuid_original.webp",
+    "score": 1.0,
+    "metadata": {
+      "title": "Summer Beach",
+      "description": "Fun times",
+      "taken_time": "2023-08-01",
+      "camera": "Sony A7M4",
+      "preview_url": "https://cdn.haozheli.com/uuid_preview.webp",
+      "original_url": "https://cdn.haozheli.com/uuid_original.webp",
+      "type": "image"
+    }
   }
   ```

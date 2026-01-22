@@ -1,4 +1,5 @@
 import os
+import re
 import string
 import asyncio
 from typing import List
@@ -11,7 +12,8 @@ TRIE_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data
 # Define a minimal set of stop words for autocomplete logic
 STOP_WORDS = {
     "a", "an", "the", "in", "on", "at", "of", "to", "for", 
-    "with", "by", "from", "and", "or", "is", "are", "was", "were"
+    "with", "by", "from", "and", "or", "is", "are", "was", "were",
+    "it", "that", "this", "my", "your", "as", "but", "be"
 }
 
 class AutocompleteManager:
@@ -111,27 +113,39 @@ class AutocompleteManager:
         return " ".join(result)
 
     def _process_and_insert(self, text: str, is_phrase: bool = False):
-        # Basic tokenization
-        # Remove punctuation and split by whitespace
-        # We want to keep the original casing for the stored phrase if possible, 
-        # but for simplicity in this Trie which lowercases everything in `insert`,
-        # we will just store the cleaned lowercased suffix.
-        # Ideally, we should store the original text slice, but let's stick to lower for consistency.
+        # Improved logic:
+        # 1. Split by sentence terminators/punctuation to avoid crossing semantic boundaries.
+        #    e.g. "xxxx. SF, CA" -> ["xxxx", "SF, CA"]
+        #    This prevents "xxxx" from suggesting "SF, CA".
+        segments = re.split(r'[.!?;:\n]+', text)
+
+        # Prepare punctuation translator:
+        # We replace most punctuation with space, but we might want to handle apostrophes differently 
+        # (e.g., keep them attached to words like "don't", "O'Connor").
+        # For now, let's keep the original logic mapping all punctuation to space for simplicity/consistency,
+        # unless specifically requested to handle apostrophes effectively. 
+        # User asked for "Better" behavior - preserving intra-word apostrophes is generally better.
         
-        translator = str.maketrans(string.punctuation, ' ' * len(string.punctuation))
-        clean_text = text.translate(translator).lower()
-        words = clean_text.split()
-        
-        # Generate suffixes
-        # "Osaka Castle Park" -> ["osaka castle park", "castle park", "park"]
-        for i in range(len(words)):
-            word = words[i]
-            if len(word) < 2: continue # Skip single chars
+        punc_to_remove = string.punctuation.replace("'", "") # Keep '
+        translator = str.maketrans(punc_to_remove, ' ' * len(punc_to_remove))
+
+        for segment in segments:
+            if not segment.strip(): continue
+
+            # Clean segment: keep ' but lower case, remove other punctuation
+            clean_text = segment.translate(translator).lower()
+            words = clean_text.split()
             
-            # Construct suffix using smart limit (limit=3 significant words)
-            suffix_phrase = self._get_smart_suffix(words, i, limit=3)
-            
-            self.trie.insert(word, phrase=suffix_phrase)
+            # Generate suffixes for this segment only
+            for i in range(len(words)):
+                word = words[i]
+                # Filter out pure punctuation remnants if any (though translate handles most)
+                if len(word) < 2 and word not in ("a", "i"): continue 
+                
+                # Construct suffix using smart limit (limit=3 significant words)
+                suffix_phrase = self._get_smart_suffix(words, i, limit=3)
+                
+                self.trie.insert(word, phrase=suffix_phrase)
 
     def suggest(self, query: str) -> List[str]:
         if not query or not self.is_ready:
