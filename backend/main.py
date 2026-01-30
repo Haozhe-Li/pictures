@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from core.random_query import generate_random_query
 import secrets
 import json
+from enum import Enum
 import redis.asyncio as redis
 
 # Imports from Core
@@ -123,9 +124,17 @@ def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
 
 
 # --- Pydantic Models for Search ---
+class SearchMode(str, Enum):
+    HYBRID = "hybrid"
+    TEXT_ONLY = "text-only"
+    IMAGE_ONLY = "image-only"
+
+
 class SearchRequest(BaseModel):
     query: str
     limit: int = 4
+    similarity_threshold: Optional[float] = None
+    search_mode: SearchMode = SearchMode.HYBRID
 
 
 class SimilarToRequest(BaseModel):
@@ -334,7 +343,7 @@ async def search_images(request: SearchRequest):
         print("Searching Qdrant...")
         # 3. Search
         results = await qdrant_wrapper.search(
-            dense_vector=dense_embedding, sparse_vector=sparse_vec, limit=request.limit
+            dense_vector=dense_embedding, sparse_vector=sparse_vec, limit=request.limit, similarity_threshold=request.similarity_threshold, search_mode=request.search_mode
         )
 
         print(results)

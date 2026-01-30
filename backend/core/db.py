@@ -71,28 +71,57 @@ class QdrantClientWrapper:
         )
 
     async def search(
-        self, dense_vector: List[float], sparse_vector: Dict[str, Any], limit: int = 10
+        self, dense_vector: List[float], sparse_vector: Dict[str, Any], limit: int = 10, similarity_threshold: Optional[float] = None, search_mode: str = "hybrid"
     ):
-        prefetch = [
-            models.Prefetch(
-                query=dense_vector,
-                using="dense-image",
-                limit=limit * 2,
-            ),
-            models.Prefetch(
-                query=dense_vector,
-                using="dense-text",
-                limit=limit * 2,
-            ),
-            models.Prefetch(
-                query=models.SparseVector(
-                    indices=sparse_vector["indices"],
-                    values=sparse_vector["values"],
+        if search_mode == "hybrid":
+            prefetch = [
+                models.Prefetch(
+                    query=dense_vector,
+                    using="dense-image",
+                    limit=limit * 2,
+                    score_threshold=similarity_threshold,
                 ),
-                using="sparse",
-                limit=limit * 2,
-            ),
-        ]
+                models.Prefetch(
+                    query=dense_vector,
+                    using="dense-text",
+                    limit=limit * 2,
+                    score_threshold=similarity_threshold,
+                ),
+                models.Prefetch(
+                    query=models.SparseVector(
+                        indices=sparse_vector["indices"],
+                        values=sparse_vector["values"],
+                    ),
+                    using="sparse",
+                    limit=limit * 2,
+                ),
+            ]
+        elif search_mode == "text-only":
+            prefetch = [
+                models.Prefetch(
+                    query=dense_vector,
+                    using="dense-text",
+                    limit=limit * 2,
+                    score_threshold=similarity_threshold,
+                ),
+                models.Prefetch(
+                    query=models.SparseVector(
+                        indices=sparse_vector["indices"],
+                        values=sparse_vector["values"],
+                    ),
+                    using="sparse",
+                    limit=limit * 2,
+                ),
+            ]
+        elif search_mode == "image-only":
+            prefetch = [
+                models.Prefetch(
+                    query=dense_vector,
+                    using="dense-image",
+                    limit=limit * 2,
+                    score_threshold=similarity_threshold,
+                ),
+            ]
 
         search_result = await self.client.query_points(
             collection_name=settings.COLLECTION_NAME,
@@ -102,7 +131,6 @@ class QdrantClientWrapper:
                 fusion=models.Fusion.RRF,
             ),
             with_payload=True,
-            # score_threshold=0.8,
         )
         return search_result.points
 
