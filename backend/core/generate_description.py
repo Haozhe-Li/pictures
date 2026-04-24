@@ -13,7 +13,7 @@ class ImageDescriptionGenerator:
 
     def __init__(self):
         self.client = Groq()
-        self.model = "meta-llama/llama-4-maverick-17b-128e-instruct"
+        self.model = "meta-llama/llama-4-scout-17b-16e-instruct"
 
     async def generate(self, image_base64: str) -> Dict[str, str]:
         return await asyncio.to_thread(self._generate_sync, image_base64)
