@@ -7,8 +7,9 @@ async def main():
     qdrant_wrapper = QdrantClientWrapper()
     redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
     
-    print("Clearing old active pool...")
+    print("Clearing old active and explore pools...")
     await redis_client.delete("gallery:pool:active")
+    await redis_client.delete("gallery:pool:explore")
     
     offset = None
     total_added = 0
@@ -19,6 +20,7 @@ async def main():
             
         for p in points:
             await redis_client.zadd("gallery:pool:active", {str(p.id): 0})
+            await redis_client.zadd("gallery:pool:explore", {str(p.id): 0})
             total_added += 1
             
         print(f"Added {len(points)} points. Total: {total_added}")
