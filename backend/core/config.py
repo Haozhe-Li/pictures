@@ -23,10 +23,7 @@ class Settings:
     JINA_URL = "https://api.jina.ai/v1/embeddings"
 
     # Redis Config
-    REDIS_HOST = os.getenv("REDIS_HOST")
-    REDIS_PORT = int(os.getenv("REDIS_PORT", 16666))
-    REDIS_USERNAME = os.getenv("REDIS_USERNAME", "default")
-    REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+    REDIS_URL = os.getenv("REDIS_URL")
 
     # Project Paths
     PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

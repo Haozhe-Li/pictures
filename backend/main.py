@@ -26,11 +26,8 @@ from core.autocomplete import autocomplete_manager
 # --- Initialize Clients ---
 jina_client = JinaClient()
 qdrant_wrapper = QdrantClientWrapper()
-redis_client = redis.Redis(
-    host=settings.REDIS_HOST,
-    port=settings.REDIS_PORT,
-    username=settings.REDIS_USERNAME,
-    password=settings.REDIS_PASSWORD,
+redis_client = redis.Redis.from_url(
+    settings.REDIS_URL,
     decode_responses=True,
 )
 
@@ -65,9 +62,10 @@ async def autocomplete(q: str):
     """
     if not q:
         return {"suggestions": []}
-    
+
     suggestions = autocomplete_manager.suggest(q)
     return {"suggestions": suggestions}
+
 
 @app.get("/image/{image_id}")
 async def get_image_by_id(image_id: str):
@@ -78,7 +76,7 @@ async def get_image_by_id(image_id: str):
         point = await qdrant_wrapper.get_point(image_id)
         if not point:
             raise HTTPException(status_code=404, detail="Image not found")
-        
+
         metadata = point.payload
         return SearchResult(
             preview_url=metadata.get("preview_url", ""),
@@ -92,6 +90,7 @@ async def get_image_by_id(image_id: str):
             raise e
         print(f"Error fetching image {image_id}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
 
 @app.post("/autocomplete/build")
 async def build_autocomplete():
@@ -153,6 +152,11 @@ class SearchResult(BaseModel):
 class GalleryResponse(BaseModel):
     items: List[SearchResult]
     next_cursor: Optional[str] = None
+
+
+class FeedRequest(BaseModel):
+    limit: int = 20
+    seen_ids: List[str] = []
 
 
 class GenerateDescriptionResponse(BaseModel):
@@ -279,7 +283,9 @@ async def ingest_image(
             payload=payload,
         )
 
-        # await invalidate_gallery_cache()
+        # 6. Add to Redis Pools for Waterfall Recommendation
+        await redis_client.zadd("gallery:pool:active", {point_id: 0})
+        await redis_client.zadd("gallery:pool:explore", {point_id: 0})
 
         return {
             "status": "success",
@@ -343,7 +349,11 @@ async def search_images(request: SearchRequest):
         print("Searching Qdrant...")
         # 3. Search
         results = await qdrant_wrapper.search(
-            dense_vector=dense_embedding, sparse_vector=sparse_vec, limit=request.limit, similarity_threshold=request.similarity_threshold, search_mode=request.search_mode
+            dense_vector=dense_embedding,
+            sparse_vector=sparse_vec,
+            limit=request.limit,
+            similarity_threshold=request.similarity_threshold,
+            search_mode=request.search_mode,
         )
 
         print(results)
@@ -425,45 +435,104 @@ async def similar_to_image(request: SimilarToRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/gallery", response_model=GalleryResponse)
-async def get_gallery(limit: int = 20, cursor: Optional[str] = None):
+@app.post("/gallery", response_model=GalleryResponse)
+async def get_gallery(request: FeedRequest):
     """
-    Get all images in a gallery view with pagination.
+    Get dynamic waterfall images using Redis Waterfall logic.
     """
-
     try:
-        # 1. Try Cache
-        cache_key = f"gallery:{limit}:{cursor}"
-        cached_data = await redis_client.get(cache_key)
-        if cached_data:
-            print("Cache Hit!")
-            return GalleryResponse(**json.loads(cached_data))
+        import random
 
-        print("Cache Miss! Fetching from Qdrant...")
+        limit = request.limit
+        seen_set = set(request.seen_ids)
 
-        # 2. Fetch from DB
-        points, next_cursor = await qdrant_wrapper.scroll(limit=limit, offset=cursor)
+        # Calculate roughly 80% hot, 20% cold
+        hot_limit = int(limit * 0.8)
+        cold_limit = limit - hot_limit
+
+        # Dynamically calculate how many items to fetch from Redis to guarantee enough unseen images
+        fetch_count = len(seen_set) + limit + 20
+
+        # 1. Fetch hot images (Exploit)
+        # Fetch enough to account for seen_ids
+        hot_pool = await redis_client.zrevrange("gallery:pool:active", 0, fetch_count)
+        available_hot = [cid for cid in hot_pool if cid not in seen_set]
+        hot_ids = available_hot[:hot_limit]
+
+        # 2. Fetch cold images (Explore)
+        # Fetch enough from explore pool
+        cold_pool = await redis_client.zrange("gallery:pool:explore", 0, fetch_count)
+        # Exclude IDs already in hot_ids and seen_ids
+        available_cold = [
+            cid for cid in cold_pool if cid not in seen_set and cid not in hot_ids
+        ]
+
+        # Randomly pick up to cold_limit
+        cold_ids = random.sample(available_cold, min(cold_limit, len(available_cold)))
+
+        # 3. Combine and shuffle
+        final_ids = hot_ids + cold_ids
+        random.shuffle(final_ids)
+
+        if not final_ids:
+            return GalleryResponse(items=[], next_cursor=None)
+
+        # 4. Fetch metadata from Qdrant
+        points = await qdrant_wrapper.client.retrieve(
+            collection_name=settings.COLLECTION_NAME, ids=final_ids
+        )
+
+        points_map = {str(p.id): p for p in points}
 
         items = []
-        for point in points:
-            items.append(
-                SearchResult(
-                    id=str(point.id),
-                    preview_url=point.payload.get("preview_url", ""),
-                    original_url=point.payload.get("original_url", ""),
-                    metadata=point.payload,
-                    score=1.0,  # Default score for browsing
+        for pid in final_ids:
+            if pid in points_map:
+                point = points_map[pid]
+                items.append(
+                    SearchResult(
+                        id=str(point.id),
+                        preview_url=point.payload.get("preview_url", ""),
+                        original_url=point.payload.get("original_url", ""),
+                        metadata=point.payload,
+                        score=1.0,  # Default score for browsing
+                    )
                 )
-            )
 
-        response = GalleryResponse(items=items, next_cursor=next_cursor)
+        # 5. Async trigger impressions for explore images
+        # For simplicity and speed in Redis, we await them directly, it's very fast
+        for cid in cold_ids:
+            await redis_client.zincrby("gallery:pool:explore", 1, cid)
+            await redis_client.zincrby("gallery:pool:active", 1, cid)
 
-        # 3. Save to Cache
-        await redis_client.set(
-            cache_key, response.model_dump_json(), ex=300
-        )  # TTL 5 minutes
+            # Check graduation
+            score = await redis_client.zscore("gallery:pool:explore", cid)
+            if score and score >= 100:
+                await redis_client.zrem("gallery:pool:explore", cid)
 
-        return response
+        return GalleryResponse(items=items, next_cursor=None)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class InteractRequest(BaseModel):
+    image_id: str
+    action_type: str  # 'click' or 'share'
+
+
+@app.post("/interact")
+async def interact_image(request: InteractRequest):
+    """
+    Interaction loop for tracking clicks and shares.
+    """
+    try:
+        image_id = request.image_id
+        if request.action_type == "click":
+            await redis_client.hincrby("gallery:counters:click", image_id, 1)
+            await redis_client.zincrby("gallery:pool:active", 2, image_id)
+        elif request.action_type == "share":
+            await redis_client.hincrby("gallery:counters:share", image_id, 1)
+            await redis_client.zincrby("gallery:pool:active", 4, image_id)
+        return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -483,6 +552,31 @@ async def generate_random_query_endpoint():
 @app.get("/health")
 async def health_check():
     """
-    Health check endpoint.
+    Health check endpoint, also used as a trigger for heat decay cron.
     """
+    import time
+
+    try:
+        # Check last decay time
+        last_run = await redis_client.get("gallery:decay:last_run")
+        current_time = time.time()
+
+        # Every 2 hours (7200 seconds)
+        if not last_run or (current_time - float(last_run)) > 7200:
+            await redis_client.set("gallery:decay:last_run", current_time)
+
+            photos = await redis_client.zrange(
+                "gallery:pool:active", 0, -1, withscores=True
+            )
+            for photo_id, score in photos:
+                new_score = score * 0.9
+                if new_score < 0.1:
+                    await redis_client.zrem("gallery:pool:active", photo_id)
+                else:
+                    await redis_client.zadd(
+                        "gallery:pool:active", {photo_id: new_score}
+                    )
+    except Exception as e:
+        print(f"Decay Error: {e}")
+
     return {"status": "ok"}
