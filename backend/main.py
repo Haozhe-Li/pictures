@@ -571,12 +571,10 @@ async def health_check():
             for photo_id, score in photos:
                 if score == 0:
                     continue
-                new_score = score * 0.9
+                new_score = score * 0.98
                 if new_score < 0.1:
                     new_score = 0
-                await redis_client.zadd(
-                    "gallery:pool:active", {photo_id: new_score}
-                )
+                await redis_client.zadd("gallery:pool:active", {photo_id: new_score})
     except Exception as e:
         print(f"Decay Error: {e}")
 
