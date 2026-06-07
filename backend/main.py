@@ -460,15 +460,18 @@ async def get_gallery(request: FeedRequest):
         hot_ids = available_hot[:hot_limit]
 
         # 2. Fetch cold images (Explore)
-        # Fetch enough from explore pool
+        # zrange returns ascending by score (impression count), so least-shown items come first
         cold_pool = await redis_client.zrange("gallery:pool:explore", 0, fetch_count)
-        # Exclude IDs already in hot_ids and seen_ids
+        # Exclude IDs already in hot_ids and seen_ids; preserve ascending score order
         available_cold = [
             cid for cid in cold_pool if cid not in seen_set and cid not in hot_ids
         ]
 
-        # Randomly pick up to cold_limit
-        cold_ids = random.sample(available_cold, min(cold_limit, len(available_cold)))
+        # Take least-shown items first (front of list has lowest impression counts).
+        # Shuffle only within a small candidate window to add variety without causing repeats.
+        candidate_window = available_cold[: cold_limit * 3]
+        random.shuffle(candidate_window)
+        cold_ids = candidate_window[:cold_limit]
 
         # 3. Combine and shuffle
         final_ids = hot_ids + cold_ids
@@ -504,9 +507,9 @@ async def get_gallery(request: FeedRequest):
             await redis_client.zincrby("gallery:pool:explore", 1, cid)
             await redis_client.zincrby("gallery:pool:active", 1, cid)
 
-            # Check graduation
+            # Check graduation: remove from explore pool after 30 impressions
             score = await redis_client.zscore("gallery:pool:explore", cid)
-            if score and score >= 100:
+            if score and score >= 30:
                 await redis_client.zrem("gallery:pool:explore", cid)
 
         return GalleryResponse(items=items, next_cursor=None)
