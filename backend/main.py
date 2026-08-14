@@ -200,7 +200,7 @@ async def ingest_image(
 
         # 1.1 Save Preview (Quality 10) with lower resolution
         await run_in_threadpool(
-            save_as_webp, file_bytes, temp_filename_preview, 5, max_size=2000
+            save_as_webp, file_bytes, temp_filename_preview, 5, max_size=1200
         )
 
         # 1.2 Save Original (Quality 90)
@@ -446,8 +446,8 @@ async def get_gallery(request: FeedRequest):
         limit = request.limit
         seen_set = set(request.seen_ids)
 
-        # Calculate roughly 80% hot, 20% cold
-        hot_limit = int(limit * 0.8)
+        # Calculate roughly 90% hot, 10% cold
+        hot_limit = int(limit * 0.9)
         cold_limit = limit - hot_limit
 
         # Dynamically calculate how many items to fetch from Redis to guarantee enough unseen images

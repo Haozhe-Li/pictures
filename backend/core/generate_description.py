@@ -3,7 +3,7 @@ import json
 import re
 from typing import Dict
 
-from groq import Groq
+from openai import OpenAI
 
 
 class ImageDescriptionGenerator:
@@ -12,8 +12,8 @@ class ImageDescriptionGenerator:
     """
 
     def __init__(self):
-        self.client = Groq()
-        self.model = "meta-llama/llama-4-scout-17b-16e-instruct"
+        self.client = OpenAI()
+        self.model = "gpt-5.6-luna"
 
     async def generate(self, image_base64: str) -> Dict[str, str]:
         return await asyncio.to_thread(self._generate_sync, image_base64)
@@ -52,9 +52,7 @@ Requirements:
         completion = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
-            temperature=0.8,
             max_completion_tokens=512,
-            top_p=1,
             stream=False,
             response_format={"type": "json_object"},
         )
