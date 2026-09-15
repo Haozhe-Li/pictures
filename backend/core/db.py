@@ -44,6 +44,18 @@ class QdrantClientWrapper:
         else:
             print(f"Collection {settings.COLLECTION_NAME} already exists.")
 
+        # find_point_by_image_url filters on original_url; without an index that
+        # is a full scan. Creating an existing index is a no-op on Qdrant's side,
+        # so this is safe to run on every startup.
+        try:
+            await self.client.create_payload_index(
+                collection_name=settings.COLLECTION_NAME,
+                field_name="original_url",
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
+        except Exception as e:
+            print(f"Warning: could not ensure payload index on original_url: {e}")
+
     async def upsert_point(
         self,
         point_id: str,
@@ -122,6 +134,8 @@ class QdrantClientWrapper:
                     score_threshold=similarity_threshold,
                 ),
             ]
+        else:
+            raise ValueError(f"Unsupported search_mode: {search_mode}")
 
         search_result = await self.client.query_points(
             collection_name=settings.COLLECTION_NAME,

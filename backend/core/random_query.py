@@ -1,4 +1,4 @@
-from random import random
+import random
 
 
 async def generate_random_query() -> str:

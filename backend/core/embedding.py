@@ -18,11 +18,10 @@ class JinaClient:
         }
         # Initialize Redis connection
         try:
-            self.redis_client = redis.Redis(
-                host=settings.REDIS_HOST,
-                port=settings.REDIS_PORT,
-                username=settings.REDIS_USERNAME,
-                password=settings.REDIS_PASSWORD,
+            if not settings.REDIS_URL:
+                raise ValueError("REDIS_URL is not configured")
+            self.redis_client = redis.Redis.from_url(
+                settings.REDIS_URL,
                 decode_responses=True,
                 socket_timeout=2,  # Short timeout to not block app if Redis is down
             )

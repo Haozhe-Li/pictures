@@ -1,9 +1,20 @@
 import uuid
 import os
+import random
+import time
 from typing import Optional, List
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, status
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    Form,
+    HTTPException,
+    Depends,
+    status,
+    BackgroundTasks,
+)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -106,11 +117,24 @@ security = HTTPBasic()
 
 
 def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
+    expected_username = os.getenv("ADMIN_USERNAME")
+    expected_password = os.getenv("ADMIN_PASSWORD")
+
+    # Without configured credentials there is nothing to authenticate against.
+    # Refuse rather than crashing inside compare_digest on a None operand.
+    if not expected_username or not expected_password:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Admin credentials are not configured on the server",
+        )
+
+    # Compare as bytes so non-ASCII credentials cannot raise, and evaluate both
+    # halves before combining so the check stays constant-time.
     is_correct_username = secrets.compare_digest(
-        credentials.username, os.getenv("ADMIN_USERNAME")
+        credentials.username.encode("utf-8"), expected_username.encode("utf-8")
     )
     is_correct_password = secrets.compare_digest(
-        credentials.password, os.getenv("ADMIN_PASSWORD")
+        credentials.password.encode("utf-8"), expected_password.encode("utf-8")
     )
 
     if not (is_correct_username and is_correct_password):
@@ -209,13 +233,15 @@ async def ingest_image(
         # Process image for Jina (Resize & Compress)
         # We generally deliver the compressed version to embedding model to save bandwidth and meet limits.
         # R2 gets the compressed WebP file via temp_filename logic.
-        base64_str = process_image_for_embedding(file_bytes)
+        base64_str = await run_in_threadpool(process_image_for_embedding, file_bytes)
 
         print("Prepare to embed image via Jina...")
 
         # 2. Dense Embedding (Image)
         try:
-            dense_embedding = jina_client.get_embedding(image_base64=base64_str)
+            dense_embedding = await run_in_threadpool(
+                jina_client.get_embedding, image_base64=base64_str
+            )
         except Exception as e:
             print(e)
             raise HTTPException(
@@ -249,11 +275,13 @@ async def ingest_image(
         metadata_text = f"{title} {description or ''} {taken_time or ''} {camera or ''}"
 
         # FastEmbed is CPU bound, might want to offload if heavy, but for short text it's fast.
-        sparse_vec = get_sparse_embedding(metadata_text)
+        sparse_vec = await run_in_threadpool(get_sparse_embedding, metadata_text)
 
         # 4.5 Dense Embedding (Metadata Text)
         try:
-            text_dense_embedding = jina_client.get_embedding(text=metadata_text)
+            text_dense_embedding = await run_in_threadpool(
+                jina_client.get_embedding, text=metadata_text
+            )
         except Exception as e:
             print(f"Warning: Metadata Dense Embedding failed: {e}")
             # Fallback? Or just fail? Let's use zero vector or fail.
@@ -341,10 +369,12 @@ async def search_images(request: SearchRequest):
     try:
         print("Getting embeddings for search query...")
         # 1. Dense (Text)
-        dense_embedding = jina_client.get_embedding(text=request.query, is_query=True)
+        dense_embedding = await run_in_threadpool(
+            jina_client.get_embedding, text=request.query, is_query=True
+        )
         print(f"Dense embedding length: {len(dense_embedding)}")
         # 2. Sparse (Text)
-        sparse_vec = get_sparse_embedding(request.query)
+        sparse_vec = await run_in_threadpool(get_sparse_embedding, request.query)
 
         print("Searching Qdrant...")
         # 3. Search
@@ -441,8 +471,6 @@ async def get_gallery(request: FeedRequest):
     Get dynamic waterfall images using Redis Waterfall logic.
     """
     try:
-        import random
-
         limit = request.limit
         seen_set = set(request.seen_ids)
 
@@ -552,33 +580,63 @@ async def generate_random_query_endpoint():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+DECAY_INTERVAL_SECONDS = 7200  # Decay at most once every 2 hours
+DECAY_FACTOR = 0.98
+DECAY_FLOOR = 0.1  # Scores below this collapse to 0
+DECAY_BATCH = 500
+
+
+async def _decay_active_pool():
+    """
+    Multiplicatively decay every score in the active pool.
+
+    Runs out of the request path (via BackgroundTasks) and batches writes into
+    pipelines, so a large pool cannot stall the caller.
+    """
+    try:
+        photos = await redis_client.zrange(
+            "gallery:pool:active", 0, -1, withscores=True
+        )
+
+        pipe = redis_client.pipeline(transaction=False)
+        pending = 0
+        for photo_id, score in photos:
+            if score == 0:
+                continue
+            new_score = score * DECAY_FACTOR
+            if new_score < DECAY_FLOOR:
+                new_score = 0
+            pipe.zadd("gallery:pool:active", {photo_id: new_score})
+            pending += 1
+            if pending % DECAY_BATCH == 0:
+                await pipe.execute()
+
+        if pending % DECAY_BATCH:
+            await pipe.execute()
+
+        print(f"Decay applied to {pending} photos.")
+    except Exception as e:
+        print(f"Decay Error: {e}")
+
+
 @app.get("/health")
-async def health_check():
+async def health_check(background_tasks: BackgroundTasks):
     """
     Health check endpoint, also used as a trigger for heat decay cron.
     """
-    import time
-
     try:
-        # Check last decay time
-        last_run = await redis_client.get("gallery:decay:last_run")
-        current_time = time.time()
-
-        # Every 2 hours (7200 seconds)
-        if not last_run or (current_time - float(last_run)) > 7200:
-            await redis_client.set("gallery:decay:last_run", current_time)
-
-            photos = await redis_client.zrange(
-                "gallery:pool:active", 0, -1, withscores=True
-            )
-            for photo_id, score in photos:
-                if score == 0:
-                    continue
-                new_score = score * 0.98
-                if new_score < 0.1:
-                    new_score = 0
-                await redis_client.zadd("gallery:pool:active", {photo_id: new_score})
+        # SET NX EX is atomic, so exactly one worker wins each decay window even
+        # when several health checks arrive at the same moment. The key expiring
+        # is what re-opens the window.
+        acquired = await redis_client.set(
+            "gallery:decay:lock",
+            time.time(),
+            nx=True,
+            ex=DECAY_INTERVAL_SECONDS,
+        )
+        if acquired:
+            background_tasks.add_task(_decay_active_pool)
     except Exception as e:
-        print(f"Decay Error: {e}")
+        print(f"Decay scheduling error: {e}")
 
     return {"status": "ok"}
