@@ -9,10 +9,11 @@ class QdrantClientWrapper:
     def __init__(self):
         self.client = AsyncQdrantClient(
             url=settings.QDRANT_URL,
+            port=None,  # honour the URL's own port (https://host => 443, not 6333)
             api_key=settings.QDRANT_API_KEY,
         )
 
-    async def init_collection(self, vector_size: int = 512):
+    async def init_collection(self, vector_size: int = settings.EMBEDDING_DIM):
         """
         Initialize the collection with dense and sparse vector configuration.
         """

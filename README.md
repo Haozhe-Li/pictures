@@ -89,7 +89,7 @@ Intelligent caching reduces latency and API costs:
 
 - **Framework:** FastAPI (Python 3.10+)
 - **Vector Database:** Qdrant
-- **Embeddings:** CLIP (OpenAI), Jina AI
+- **Embeddings:** CLIP (`jinaai/jina-clip-v1`) via a self-hosted FastEmbed service, BM25 (FastEmbed)
 - **Retrieval:** BM25 + Dense Vector Search
 - **Cache:** Redis
 - **Storage:** Cloudflare R2
@@ -261,7 +261,7 @@ Create a `.env` file in the `backend/` directory:
 | `CF_API_KEY_SECRET` | R2 access key secret                               | ✅       |
 | `QDRANT_URL`        | Qdrant endpoint (default: `http://localhost:6333`) | ✅       |
 | `QDRANT_API_KEY`    | Qdrant API key (if using cloud)                    | ⚠️       |
-| `JINA_API_KEY`      | Jina AI embeddings API key                         | ✅       |
+| `EMBEDDING_SERVICE_URL` | Base URL of the embedding service (dense vectors) | ✅       |
 | `REDIS_HOST`        | Redis host address                                 | ✅       |
 | `REDIS_PORT`        | Redis port (default: `16666`)                      | ✅       |
 | `REDIS_USERNAME`    | Redis username (default: `default`)                | ✅       |

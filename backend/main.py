@@ -27,7 +27,7 @@ import redis.asyncio as redis
 
 # Imports from Core
 from core.config import settings
-from core.embedding import JinaClient, get_sparse_embedding
+from core.embedding import EmbeddingClient, get_sparse_embedding
 from core.storage import upload_file_to_r2
 from core.db import QdrantClientWrapper
 from core.utils import process_image_for_embedding, save_as_webp
@@ -35,7 +35,7 @@ from core.generate_description import description_generator
 from core.autocomplete import autocomplete_manager
 
 # --- Initialize Clients ---
-jina_client = JinaClient()
+embedding_client = EmbeddingClient()
 qdrant_wrapper = QdrantClientWrapper()
 redis_client = redis.Redis.from_url(
     settings.REDIS_URL,
@@ -204,7 +204,7 @@ async def ingest_image(
     Ingest an image:
     1. Read and Convert to Base64
     2. Save Preview & Original Versions to R2
-    3. Get Dense Embedding from Jina
+    3. Get Dense Embedding from the embedding service
     4. Generate Sparse Embedding from Metadata
     5. Save to Qdrant
     """
@@ -230,22 +230,22 @@ async def ingest_image(
         # 1.2 Save Original (Quality 90)
         await run_in_threadpool(save_as_webp, file_bytes, temp_filename_original, 60)
 
-        # Process image for Jina (Resize & Compress)
+        # Process image for embedding (Resize & Compress)
         # We generally deliver the compressed version to embedding model to save bandwidth and meet limits.
         # R2 gets the compressed WebP file via temp_filename logic.
         base64_str = await run_in_threadpool(process_image_for_embedding, file_bytes)
 
-        print("Prepare to embed image via Jina...")
+        print("Prepare to embed image via embedding service...")
 
         # 2. Dense Embedding (Image)
         try:
             dense_embedding = await run_in_threadpool(
-                jina_client.get_embedding, image_base64=base64_str
+                embedding_client.get_embedding, image_base64=base64_str
             )
         except Exception as e:
             print(e)
             raise HTTPException(
-                status_code=500, detail=f"Jina Embedding failed: {str(e)}"
+                status_code=500, detail=f"Image embedding failed: {str(e)}"
             )
 
         print(f"Dense embedding length: {len(dense_embedding)}")
@@ -280,7 +280,7 @@ async def ingest_image(
         # 4.5 Dense Embedding (Metadata Text)
         try:
             text_dense_embedding = await run_in_threadpool(
-                jina_client.get_embedding, text=metadata_text
+                embedding_client.get_embedding, text=metadata_text
             )
         except Exception as e:
             print(f"Warning: Metadata Dense Embedding failed: {e}")
@@ -370,7 +370,7 @@ async def search_images(request: SearchRequest):
         print("Getting embeddings for search query...")
         # 1. Dense (Text)
         dense_embedding = await run_in_threadpool(
-            jina_client.get_embedding, text=request.query, is_query=True
+            embedding_client.get_embedding, text=request.query, is_query=True
         )
         print(f"Dense embedding length: {len(dense_embedding)}")
         # 2. Sparse (Text)

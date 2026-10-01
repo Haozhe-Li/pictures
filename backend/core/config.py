@@ -16,11 +16,9 @@ class Settings:
     QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", None)
     COLLECTION_NAME = "gallery_rag_hybrid"
 
-    # Jina Config
-    JINA_API_KEY = os.getenv(
-        "JINA_API_KEY",
-    )
-    JINA_URL = "https://api.jina.ai/v1/embeddings"
+    # Self-hosted embedding service (jinaai/jina-clip-v1, 768-d)
+    EMBEDDING_SERVICE_URL = os.getenv("EMBEDDING_SERVICE_URL", "http://localhost:8000")
+    EMBEDDING_DIM = 768
 
     # Redis Config
     REDIS_URL = os.getenv("REDIS_URL")

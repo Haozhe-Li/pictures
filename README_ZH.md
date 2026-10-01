@@ -89,7 +89,7 @@ Pictures 使用复杂的混合检索系统，结合了：
 
 - **框架：** FastAPI (Python 3.10+)
 - **向量数据库：** Qdrant
-- **嵌入：** CLIP (OpenAI), Jina AI
+- **嵌入：** CLIP (`jinaai/jina-clip-v1`，自托管 FastEmbed 服务), BM25 (FastEmbed)
 - **检索：** BM25 + 稠密向量搜索
 - **缓存：** Redis
 - **存储：** Cloudflare R2
@@ -261,7 +261,7 @@ gallery_RAG/
 | `CF_API_KEY_SECRET` | R2 访问密钥密文                              | ✅   |
 | `QDRANT_URL`        | Qdrant 端点（默认：`http://localhost:6333`） | ✅   |
 | `QDRANT_API_KEY`    | Qdrant API 密钥（如果使用云端）              | ⚠️   |
-| `JINA_API_KEY`      | Jina AI 嵌入 API 密钥                        | ✅   |
+| `EMBEDDING_SERVICE_URL` | 嵌入服务的基础 URL（稠密向量）            | ✅   |
 | `REDIS_HOST`        | Redis 主机地址                               | ✅   |
 | `REDIS_PORT`        | Redis 端口（默认：`16666`）                  | ✅   |
 | `REDIS_USERNAME`    | Redis 用户名（默认：`default`）              | ✅   |

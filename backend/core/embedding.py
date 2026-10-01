@@ -9,13 +9,11 @@ from fastembed import SparseTextEmbedding
 from core.config import settings
 
 
-# --- Jina Client (Dense) ---
-class JinaClient:
+# --- Embedding Service Client (Dense) ---
+class EmbeddingClient:
     def __init__(self):
-        self.headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {settings.JINA_API_KEY}",
-        }
+        self.base_url = settings.EMBEDDING_SERVICE_URL.rstrip("/")
+        self.session = requests.Session()
         # Initialize Redis connection
         try:
             if not settings.REDIS_URL:
@@ -40,7 +38,10 @@ class JinaClient:
         is_query: bool = False,
     ) -> List[float]:
         """
-        Get embedding for a single text or image using Jina CLIP v2.
+        Get a dense embedding for a single text or image from the embedding service.
+
+        `is_query` is accepted for call-site compatibility; jina-clip-v1 has no
+        query/document distinction.
         """
         # Use cache for text-only queries (e.g. Search)
         if text and not image_url and not image_base64:
@@ -68,7 +69,7 @@ class JinaClient:
             except Exception as e:
                 print(f"Redis get error: {e}")
 
-        # If not in Redis or Redis failed, get from API
+        # If not in Redis or Redis failed, call the embedding service
         embedding = self._execute_embedding_request(text=text)
 
         # Save to Redis for future
@@ -89,42 +90,31 @@ class JinaClient:
         image_base64: Optional[str] = None,
         is_query: bool = False,
     ) -> List[float]:
-        input_data = []
         if text:
-            input_data.append({"text": text})
-
-        if image_url:
-            input_data.append({"image": image_url})
-
-        if image_base64:
-            input_data.append({"image": image_base64})
-
-        if not input_data:
+            path, payload = "/embed/dense/text", {"texts": [text]}
+        elif image_url or image_base64:
+            path, payload = "/embed/dense/image", {"images": [image_url or image_base64]}
+        else:
             raise ValueError("No input provided")
 
-        data = {
-            "model": "jina-clip-v2",
-            "dimensions": 512,
-            "input": input_data,
-        }
-
-        if is_query:
-            data["task"] = "retrieval.query"
-
-        response = requests.post(settings.JINA_URL, headers=self.headers, json=data)
-
+        response = self.session.post(
+            f"{self.base_url}{path}", json=payload, timeout=(5, 60)
+        )
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
-            # Print error detail, truncated to avoid logging huge base64 reflected in error (unlikely but safe)
             error_msg = response.text[:500]
-            print("Jina API Error Detail:", error_msg)
+            print("Embedding service error:", error_msg)
             raise ValueError(
-                f"Jina API Validation Failed: {response.status_code} - {error_msg}"
+                f"Embedding service failed: {response.status_code} - {error_msg}"
             ) from e
 
-        result_data = response.json()["data"]
-        return result_data[0]["embedding"]
+        embedding = response.json()["embeddings"][0]
+        if len(embedding) != settings.EMBEDDING_DIM:
+            raise ValueError(
+                f"Unexpected embedding dim {len(embedding)}, expected {settings.EMBEDDING_DIM}"
+            )
+        return embedding
 
 
 # --- Sparse Embedding (FastEmbed) ---
