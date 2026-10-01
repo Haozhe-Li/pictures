@@ -89,7 +89,7 @@ Pictures 使用复杂的混合检索系统，结合了：
 
 - **框架：** FastAPI (Python 3.10+)
 - **向量数据库：** Qdrant
-- **嵌入：** CLIP (`jinaai/jina-clip-v1`，自托管 FastEmbed 服务), BM25 (FastEmbed)
+- **嵌入：** 自托管 FastEmbed 服务：CLIP (`jinaai/jina-clip-v1`) 负责文本↔图片、图片↔图片，多语言 MiniLM (`paraphrase-multilingual-MiniLM-L12-v2`) 负责文本↔文本，BM25 (FastEmbed)
 - **检索：** BM25 + 稠密向量搜索
 - **缓存：** Redis
 - **存储：** Cloudflare R2

@@ -13,9 +13,10 @@ class QdrantClientWrapper:
             api_key=settings.QDRANT_API_KEY,
         )
 
-    async def init_collection(self, vector_size: int = settings.EMBEDDING_DIM):
+    async def init_collection(self):
         """
         Initialize the collection with dense and sparse vector configuration.
+        `dense-image` is CLIP-sized, `dense-text` is MiniLM-sized.
         """
         collections = await self.client.get_collections()
         exists = any(
@@ -27,10 +28,10 @@ class QdrantClientWrapper:
                 collection_name=settings.COLLECTION_NAME,
                 vectors_config={
                     "dense-image": VectorParams(
-                        size=vector_size, distance=Distance.COSINE
+                        size=settings.CLIP_DIM, distance=Distance.COSINE
                     ),
                     "dense-text": VectorParams(
-                        size=vector_size, distance=Distance.COSINE
+                        size=settings.TEXT_DIM, distance=Distance.COSINE
                     ),
                 },
                 sparse_vectors_config={
@@ -44,6 +45,15 @@ class QdrantClientWrapper:
             print(f"Collection {settings.COLLECTION_NAME} created.")
         else:
             print(f"Collection {settings.COLLECTION_NAME} already exists.")
+            cfg = (
+                await self.client.get_collection(settings.COLLECTION_NAME)
+            ).config.params.vectors
+            for name, dim in (("dense-image", settings.CLIP_DIM), ("dense-text", settings.TEXT_DIM)):
+                if name not in cfg or cfg[name].size != dim:
+                    raise RuntimeError(
+                        f"Collection {settings.COLLECTION_NAME}: '{name}' is not {dim}-d; "
+                        "run scripts/migrate_text_model.py"
+                    )
 
         # find_point_by_image_url filters on original_url; without an index that
         # is a full scan. Creating an existing index is a no-op on Qdrant's side,
@@ -84,57 +94,46 @@ class QdrantClientWrapper:
         )
 
     async def search(
-        self, dense_vector: List[float], sparse_vector: Dict[str, Any], limit: int = 10, similarity_threshold: Optional[float] = None, search_mode: str = "hybrid"
+        self,
+        image_vector: Optional[List[float]],
+        text_vector: Optional[List[float]],
+        sparse_vector: Dict[str, Any],
+        limit: int = 10,
+        similarity_threshold: Optional[float] = None,
+        search_mode: str = "hybrid",
     ):
+        """
+        `image_vector` is a CLIP vector, queried against `dense-image`.
+        `text_vector` is a MiniLM vector, queried against `dense-text`.
+        Each mode only needs the vectors it uses.
+        """
+        sparse_prefetch = models.Prefetch(
+            query=models.SparseVector(
+                indices=sparse_vector["indices"],
+                values=sparse_vector["values"],
+            ),
+            using="sparse",
+            limit=limit * 2,
+        )
+
+        def dense_prefetch(vector, using):
+            return models.Prefetch(
+                query=vector,
+                using=using,
+                limit=limit * 2,
+                score_threshold=similarity_threshold,
+            )
+
         if search_mode == "hybrid":
             prefetch = [
-                models.Prefetch(
-                    query=dense_vector,
-                    using="dense-image",
-                    limit=limit * 2,
-                    score_threshold=similarity_threshold,
-                ),
-                models.Prefetch(
-                    query=dense_vector,
-                    using="dense-text",
-                    limit=limit * 2,
-                    score_threshold=similarity_threshold,
-                ),
-                models.Prefetch(
-                    query=models.SparseVector(
-                        indices=sparse_vector["indices"],
-                        values=sparse_vector["values"],
-                    ),
-                    using="sparse",
-                    limit=limit * 2,
-                ),
+                dense_prefetch(image_vector, "dense-image"),
+                dense_prefetch(text_vector, "dense-text"),
+                sparse_prefetch,
             ]
         elif search_mode == "text-only":
-            prefetch = [
-                models.Prefetch(
-                    query=dense_vector,
-                    using="dense-text",
-                    limit=limit * 2,
-                    score_threshold=similarity_threshold,
-                ),
-                models.Prefetch(
-                    query=models.SparseVector(
-                        indices=sparse_vector["indices"],
-                        values=sparse_vector["values"],
-                    ),
-                    using="sparse",
-                    limit=limit * 2,
-                ),
-            ]
+            prefetch = [dense_prefetch(text_vector, "dense-text"), sparse_prefetch]
         elif search_mode == "image-only":
-            prefetch = [
-                models.Prefetch(
-                    query=dense_vector,
-                    using="dense-image",
-                    limit=limit * 2,
-                    score_threshold=similarity_threshold,
-                ),
-            ]
+            prefetch = [dense_prefetch(image_vector, "dense-image")]
         else:
             raise ValueError(f"Unsupported search_mode: {search_mode}")
 

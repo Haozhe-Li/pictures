@@ -36,51 +36,56 @@ class EmbeddingClient:
         image_url: Optional[str] = None,
         image_base64: Optional[str] = None,
         is_query: bool = False,
+        model: Optional[str] = None,
     ) -> List[float]:
         """
         Get a dense embedding for a single text or image from the embedding service.
 
-        `is_query` is accepted for call-site compatibility; jina-clip-v1 has no
+        Images always use CLIP. Text uses `model`, which defaults to CLIP (for matching
+        against image vectors); pass `settings.TEXT_MODEL` for text-to-text matching.
+        Vectors from different models are not comparable.
+
+        `is_query` is accepted for call-site compatibility; neither model has a
         query/document distinction.
         """
         # Use cache for text-only queries (e.g. Search)
         if text and not image_url and not image_base64:
-            return self._get_cached_text_embedding(text)
+            return self._get_cached_text_embedding(text, model or settings.CLIP_MODEL)
 
         return self._execute_embedding_request(
-            text, image_url, image_base64, is_query=is_query
+            text, image_url, image_base64, is_query=is_query, model=model
         )
 
     @lru_cache(maxsize=1024)
-    def _get_cached_text_embedding(self, text: str) -> List[float]:
+    def _get_cached_text_embedding(self, text: str, model: str) -> List[float]:
         """
         Layer 1: Memory Cache (LRU)
         Layer 2: Redis Cache (Persistent)
         Layer 3: API Call
+
+        Keyed by model: vectors from different models must never be mixed up.
         """
+        dim = settings.EMBEDDING_DIMS[model]
+        redis_key = f"embedding:{model}:{text}"
         # Checks Redis before hitting API
         if self.redis_client:
-            redis_key = f"embedding:{text}"
             try:
                 cached_data = self.redis_client.get(redis_key)
                 if cached_data:
                     cached = json.loads(cached_data)
-                    if len(cached) == settings.EMBEDDING_DIM:
-                        print(f"Hit Redis cache for query: '{text}'")
+                    if len(cached) == dim:
+                        print(f"Hit Redis cache for query: '{text}' ({model})")
                         return cached
-                    # Written by an older embedding model; recompute and overwrite below.
                     print(f"Ignoring stale {len(cached)}-d cache entry for query: '{text}'")
             except Exception as e:
                 print(f"Redis get error: {e}")
 
         # If not in Redis or Redis failed, call the embedding service
-        embedding = self._execute_embedding_request(text=text)
+        embedding = self._execute_embedding_request(text=text, model=model)
 
-        # Save to Redis for future
+        # Save to Redis for future (no expiry: the key already pins the model)
         if self.redis_client:
             try:
-                # Cache for 1 week (604800 seconds) or indefinite?
-                # Let's say 24h for now or indefinite. User said "persist", so maybe no expiry.
                 self.redis_client.set(redis_key, json.dumps(embedding))
             except Exception as e:
                 print(f"Redis set error: {e}")
@@ -93,10 +98,13 @@ class EmbeddingClient:
         image_url: Optional[str] = None,
         image_base64: Optional[str] = None,
         is_query: bool = False,
+        model: Optional[str] = None,
     ) -> List[float]:
         if text:
-            path, payload = "/embed/dense/text", {"texts": [text]}
+            model = model or settings.CLIP_MODEL
+            path, payload = "/embed/dense/text", {"texts": [text], "model": model}
         elif image_url or image_base64:
+            model = settings.CLIP_MODEL
             path, payload = "/embed/dense/image", {"images": [image_url or image_base64]}
         else:
             raise ValueError("No input provided")
@@ -113,10 +121,13 @@ class EmbeddingClient:
                 f"Embedding service failed: {response.status_code} - {error_msg}"
             ) from e
 
-        embedding = response.json()["embeddings"][0]
-        if len(embedding) != settings.EMBEDDING_DIM:
+        body = response.json()
+        embedding = body["embeddings"][0]
+        dim = settings.EMBEDDING_DIMS[model]
+        if body.get("model") != model or len(embedding) != dim:
             raise ValueError(
-                f"Unexpected embedding dim {len(embedding)}, expected {settings.EMBEDDING_DIM}"
+                f"Unexpected embedding from service: model={body.get('model')!r} "
+                f"dim={len(embedding)}, expected model={model!r} dim={dim}"
             )
         return embedding
 

@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 import os
 import random
@@ -33,6 +34,10 @@ from core.db import QdrantClientWrapper
 from core.utils import process_image_for_embedding, save_as_webp
 from core.generate_description import description_generator
 from core.autocomplete import autocomplete_manager
+
+async def _none():
+    return None
+
 
 # --- Initialize Clients ---
 embedding_client = EmbeddingClient()
@@ -280,7 +285,9 @@ async def ingest_image(
         # 4.5 Dense Embedding (Metadata Text)
         try:
             text_dense_embedding = await run_in_threadpool(
-                embedding_client.get_embedding, text=metadata_text
+                embedding_client.get_embedding,
+                text=metadata_text,
+                model=settings.TEXT_MODEL,
             )
         except Exception as e:
             print(f"Warning: Metadata Dense Embedding failed: {e}")
@@ -362,24 +369,35 @@ async def generate_description_endpoint(file: UploadFile = File(...)):
 async def search_images(request: SearchRequest):
     """
     Search for images using text query.
-    1. Get Dense Embedding for Query (Text)
-    2. Get Sparse Embedding for Query (Text)
-    3. Retrieve from Qdrant
+    1. Get the CLIP embedding of the query (matches `dense-image`)
+    2. Get the MiniLM embedding of the query (matches `dense-text`)
+    3. Get Sparse Embedding for Query (Text)
+    4. Retrieve from Qdrant
+    Only the embeddings the chosen search_mode actually uses are requested.
     """
     try:
         print("Getting embeddings for search query...")
-        # 1. Dense (Text)
-        dense_embedding = await run_in_threadpool(
-            embedding_client.get_embedding, text=request.query, is_query=True
+        use_image = request.search_mode != SearchMode.TEXT_ONLY
+        use_text = request.search_mode != SearchMode.IMAGE_ONLY
+
+        async def dense(model: str):
+            return await run_in_threadpool(
+                embedding_client.get_embedding, text=request.query, is_query=True, model=model
+            )
+
+        # 1+2. Dense. Issued together; the service queues them on its single worker.
+        image_vec, text_vec = await asyncio.gather(
+            dense(settings.CLIP_MODEL) if use_image else _none(),
+            dense(settings.TEXT_MODEL) if use_text else _none(),
         )
-        print(f"Dense embedding length: {len(dense_embedding)}")
-        # 2. Sparse (Text)
+        # 3. Sparse (Text)
         sparse_vec = await run_in_threadpool(get_sparse_embedding, request.query)
 
         print("Searching Qdrant...")
-        # 3. Search
+        # 4. Search
         results = await qdrant_wrapper.search(
-            dense_vector=dense_embedding,
+            image_vector=image_vec,
+            text_vector=text_vec,
             sparse_vector=sparse_vec,
             limit=request.limit,
             similarity_threshold=request.similarity_threshold,
@@ -412,7 +430,7 @@ async def similar_to_image(request: SimilarToRequest):
     """
     Find similar images based on an existing image URL.
     1. Check if image URL exists in Qdrant
-    2. Retrieve the image's vectors (dense-text + sparse)
+    2. Retrieve the image's stored vectors (dense-image + dense-text + sparse)
     3. Perform a hybrid search
     4. Return results in the same schema as /search
     """
@@ -425,17 +443,21 @@ async def similar_to_image(request: SimilarToRequest):
         if not vectors:
             raise HTTPException(status_code=500, detail="Vectors not found for image")
 
-        dense_vector = vectors.get("dense-text") or vectors.get("dense-image")
+        # Each stored vector is queried against its own named vector: the two
+        # dense spaces (CLIP 768-d, MiniLM 384-d) are not interchangeable.
+        image_vector = vectors.get("dense-image")
+        text_vector = vectors.get("dense-text")
         sparse_vector = vectors.get("sparse")
 
-        if dense_vector is None or sparse_vector is None:
+        if image_vector is None or text_vector is None or sparse_vector is None:
             raise HTTPException(status_code=500, detail="Required vectors missing")
 
         sparse_vec = qdrant_wrapper.normalize_sparse_vector(sparse_vector)
 
         # Fetch one extra to allow removing the original image from results
         results = await qdrant_wrapper.search(
-            dense_vector=dense_vector,
+            image_vector=image_vector,
+            text_vector=text_vector,
             sparse_vector=sparse_vec,
             limit=request.limit + 1,
         )

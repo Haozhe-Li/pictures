@@ -67,7 +67,7 @@ Pictures uses a sophisticated hybrid retrieval system that combines:
 ![Hybrid Retrieval Flow](https://cdn.haozheli.com/pictures-flow-chart.webp)
 
 1. **Sparse Retrieval (BM25)** — Keyword-based metadata matching
-2. **Dense Retrieval (CLIP)** — Semantic text and image embeddings
+2. **Dense Retrieval** — CLIP for query→image (`dense-image`), multilingual MiniLM for query→title/description (`dense-text`)
 3. **Vector Storage (Qdrant)** — Efficient similarity search
 4. **Rank Fusion (RRF)** — Reciprocal Rank Fusion for optimal results
 
@@ -89,7 +89,7 @@ Intelligent caching reduces latency and API costs:
 
 - **Framework:** FastAPI (Python 3.10+)
 - **Vector Database:** Qdrant
-- **Embeddings:** CLIP (`jinaai/jina-clip-v1`) via a self-hosted FastEmbed service, BM25 (FastEmbed)
+- **Embeddings:** via a self-hosted FastEmbed service: CLIP (`jinaai/jina-clip-v1`) for text↔image and image↔image, multilingual MiniLM (`paraphrase-multilingual-MiniLM-L12-v2`) for text↔text, BM25 (FastEmbed)
 - **Retrieval:** BM25 + Dense Vector Search
 - **Cache:** Redis
 - **Storage:** Cloudflare R2

@@ -1,7 +1,9 @@
-"""Delete cached query embeddings whose dimension does not match EMBEDDING_DIM.
+"""Delete cached query embeddings that the backend can no longer use.
 
-Only `embedding:*` keys are considered, and only those with a wrong-sized vector;
-everything else in Redis (recommendation pools, counters, ...) is left alone.
+Cache keys are `embedding:{model}:{text}`. This removes every `embedding:*` key that
+is either an old unprefixed entry (from before keys carried a model name) or holds a
+vector of the wrong size for its model. Anything else in Redis (recommendation pools,
+counters, ...) is left alone.
 
   python -m scripts.purge_stale_embedding_cache            # list only (dry run)
   python -m scripts.purge_stale_embedding_cache --apply    # delete them
@@ -17,6 +19,18 @@ import redis
 from core.config import settings
 
 
+def check(key: str, value) -> bool:
+    """True if this cache entry is valid under the current models."""
+    body = key[len("embedding:") :]
+    for model, dim in settings.EMBEDDING_DIMS.items():
+        if body.startswith(model + ":"):
+            try:
+                return len(json.loads(value or "[]")) == dim
+            except (ValueError, TypeError):
+                return False
+    return False  # no known model prefix: legacy key
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="actually delete (default: dry run)")
@@ -25,24 +39,23 @@ def main() -> None:
     r = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True, socket_timeout=10)
     stale, ok = [], 0
     for key in r.scan_iter("embedding:*", count=1000):
-        try:
-            n = len(json.loads(r.get(key) or "[]"))
-        except (ValueError, TypeError):
-            n = -1
-        if n == settings.EMBEDDING_DIM:
+        if check(key, r.get(key)):
             ok += 1
         else:
-            stale.append((key, n))
+            stale.append(key)
 
-    print(f"{ok} cache entries are {settings.EMBEDDING_DIM}-d (kept), {len(stale)} are stale:")
-    for key, n in stale:
-        print(f"  {n}-d  {key[:80]!r}")
+    print(f"{ok} cache entries are valid (kept), {len(stale)} are unusable:")
+    for key in stale[:20]:
+        print(f"  {key[:80]!r}")
+    if len(stale) > 20:
+        print(f"  ... and {len(stale) - 20} more")
     if not stale:
         return
     if not args.apply:
         print("dry run: nothing deleted. Re-run with --apply to delete the entries above.")
         return
-    r.delete(*[k for k, _ in stale])
+    for i in range(0, len(stale), 500):
+        r.delete(*stale[i : i + 500])
     print(f"deleted {len(stale)} keys")
 
 
