@@ -64,8 +64,12 @@ class EmbeddingClient:
             try:
                 cached_data = self.redis_client.get(redis_key)
                 if cached_data:
-                    print(f"Hit Redis cache for query: '{text}'")
-                    return json.loads(cached_data)
+                    cached = json.loads(cached_data)
+                    if len(cached) == settings.EMBEDDING_DIM:
+                        print(f"Hit Redis cache for query: '{text}'")
+                        return cached
+                    # Written by an older embedding model; recompute and overwrite below.
+                    print(f"Ignoring stale {len(cached)}-d cache entry for query: '{text}'")
             except Exception as e:
                 print(f"Redis get error: {e}")
 
