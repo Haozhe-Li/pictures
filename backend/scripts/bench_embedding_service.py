@@ -1,4 +1,4 @@
-"""Concurrency benchmark for the embedding service (dense text endpoint, jina-clip-v1 only).
+"""Concurrency benchmark for the embedding service (dense text endpoint).
 
 Sends one text per request, like the backend's search path does, at increasing
 concurrency, and reports throughput and latency percentiles per level. Meant to be
@@ -6,6 +6,8 @@ run from inside the private network, so the numbers exclude public-internet late
 
   python -m scripts.bench_embedding_service
   python -m scripts.bench_embedding_service --levels 1,8,32 --requests 200
+  python -m scripts.bench_embedding_service --models minilm        # one model only
+  python -m scripts.bench_embedding_service --models clip,minilm   # default: both
   python -m scripts.bench_embedding_service --url http://embedding.railway.internal:8080
 
 Uses EMBEDDING_SERVICE_URL (the same setting the backend uses) unless --url is given.
@@ -24,7 +26,8 @@ import requests
 
 from core.config import settings
 
-MODEL = settings.CLIP_MODEL  # jina-clip-v1 only; MiniLM is deliberately not benchmarked
+# Short aliases for --models; anything else is passed through as a full model name.
+MODEL_ALIASES = {"clip": settings.CLIP_MODEL, "jina": settings.CLIP_MODEL, "minilm": settings.TEXT_MODEL}
 
 TEXTS = [
     "A golden retriever running through a field of sunflowers",
@@ -71,7 +74,7 @@ def health(base: str) -> dict:
     return r.json()
 
 
-def run_level(base: str, conc: int, n: int, counter: list):
+def run_level(base: str, model: str, conc: int, n: int, counter: list):
     local = threading.local()
     results = []  # (status, seconds)
     lock = threading.Lock()
@@ -85,7 +88,7 @@ def run_level(base: str, conc: int, n: int, counter: list):
         t = time.perf_counter()
         try:
             code = local.s.post(
-                f"{base}/embed/dense/text", json={"texts": [text], "model": MODEL}, timeout=120
+                f"{base}/embed/dense/text", json={"texts": [text], "model": model}, timeout=120
             ).status_code
         except requests.RequestException as e:
             code = type(e).__name__
@@ -99,26 +102,18 @@ def run_level(base: str, conc: int, n: int, counter: list):
     return results, time.perf_counter() - t0
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default=settings.EMBEDDING_SERVICE_URL)
-    ap.add_argument("--levels", default="1,2,4,8,16,32,64,128", help="comma-separated concurrency levels")
-    ap.add_argument("--requests", type=int, default=0, help="requests per level (default: max(60, 4*concurrency))")
-    ap.add_argument("--pause", type=float, default=2.0, help="seconds to rest between levels")
-    args = ap.parse_args()
-    base = args.url.rstrip("/")
-
+def bench_model(base: str, model: str, levels: list, n_req: int, pause: float) -> None:
     h = health(base)
-    print(f"target: {base}")
-    print(f"model={h.get('dense_model')} queue_max={h.get('queue_max')} rss={h.get('rss_mb')}MB queue={h.get('queue_depth')}")
+    print(f"\n=== {model} ===")
+    print(f"service dense_model={h.get('dense_model')} queue_max={h.get('queue_max')} rss={h.get('rss_mb')}MB queue={h.get('queue_depth')}")
     counter = [0]
     for _ in range(5):  # warm up connections and ONNX
-        requests.post(f"{base}/embed/dense/text", json={"texts": ["warm up"], "model": MODEL}, timeout=60)
+        requests.post(f"{base}/embed/dense/text", json={"texts": ["warm up"], "model": model}, timeout=60)
 
-    print(f"\n{'conc':>4} {'n':>4} {'ok':>4} {'req/s':>7} | {'mean':>6} {'p50':>6} {'p95':>6} {'p99':>6} {'max':>6} (ms) | not-200 | rss  q-depth")
-    for conc in [int(x) for x in args.levels.split(",")]:
-        n = args.requests or max(60, conc * 4)
-        results, wall = run_level(base, conc, n, counter)
+    print(f"{'conc':>4} {'n':>4} {'ok':>4} {'req/s':>7} | {'mean':>6} {'p50':>6} {'p95':>6} {'p99':>6} {'max':>6} (ms) | not-200 | rss  q-depth")
+    for conc in levels:
+        n = n_req or max(60, conc * 4)
+        results, wall = run_level(base, model, conc, n, counter)
         ok = [dt * 1000 for code, dt in results if code == 200]
         bad = dict(Counter(code for code, _ in results if code != 200))
         h = health(base)
@@ -132,7 +127,28 @@ def main() -> None:
             f"{bad or '-'} | {h.get('rss_mb')}MB q={h.get('queue_depth')}",
             flush=True,
         )
-        time.sleep(args.pause)
+        time.sleep(pause)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", default=settings.EMBEDDING_SERVICE_URL)
+    ap.add_argument(
+        "--models",
+        default="clip,minilm",
+        help="comma-separated models: aliases clip/jina (jina-clip-v1), minilm (paraphrase-multilingual-MiniLM-L12-v2), or full model names",
+    )
+    ap.add_argument("--levels", default="1,2,4,8,16,32,64,128", help="comma-separated concurrency levels")
+    ap.add_argument("--requests", type=int, default=0, help="requests per level (default: max(60, 4*concurrency))")
+    ap.add_argument("--pause", type=float, default=2.0, help="seconds to rest between levels")
+    args = ap.parse_args()
+    base = args.url.rstrip("/")
+    levels = [int(x) for x in args.levels.split(",")]
+    models = [MODEL_ALIASES.get(m.strip().lower(), m.strip()) for m in args.models.split(",") if m.strip()]
+
+    print(f"target: {base}")
+    for model in models:
+        bench_model(base, model, levels, args.requests, args.pause)
 
     print("\n503 = the service's queue was full (it is protecting itself); latency at high concurrency is mostly queue wait.")
 
