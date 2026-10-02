@@ -1,4 +1,4 @@
-"""Concurrency benchmark for the embedding service (dense text endpoint).
+"""Concurrency benchmark for the embedding service (dense text endpoint, jina-clip-v1 only).
 
 Sends one text per request, like the backend's search path does, at increasing
 concurrency, and reports throughput and latency percentiles per level. Meant to be
@@ -23,6 +23,8 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 from core.config import settings
+
+MODEL = settings.CLIP_MODEL  # jina-clip-v1 only; MiniLM is deliberately not benchmarked
 
 TEXTS = [
     "A golden retriever running through a field of sunflowers",
@@ -83,7 +85,7 @@ def run_level(base: str, conc: int, n: int, counter: list):
         t = time.perf_counter()
         try:
             code = local.s.post(
-                f"{base}/embed/dense/text", json={"texts": [text]}, timeout=120
+                f"{base}/embed/dense/text", json={"texts": [text], "model": MODEL}, timeout=120
             ).status_code
         except requests.RequestException as e:
             code = type(e).__name__
@@ -111,7 +113,7 @@ def main() -> None:
     print(f"model={h.get('dense_model')} queue_max={h.get('queue_max')} rss={h.get('rss_mb')}MB queue={h.get('queue_depth')}")
     counter = [0]
     for _ in range(5):  # warm up connections and ONNX
-        requests.post(f"{base}/embed/dense/text", json={"texts": ["warm up"]}, timeout=60)
+        requests.post(f"{base}/embed/dense/text", json={"texts": ["warm up"], "model": MODEL}, timeout=60)
 
     print(f"\n{'conc':>4} {'n':>4} {'ok':>4} {'req/s':>7} | {'mean':>6} {'p50':>6} {'p95':>6} {'p99':>6} {'max':>6} (ms) | not-200 | rss  q-depth")
     for conc in [int(x) for x in args.levels.split(",")]:
