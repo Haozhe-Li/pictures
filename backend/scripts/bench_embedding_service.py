@@ -4,10 +4,16 @@ Sends one text per request, like the backend's search path does, at increasing
 concurrency, and reports throughput and latency percentiles per level. Meant to be
 run from inside the private network, so the numbers exclude public-internet latency.
 
+Three phases run in order, each over every concurrency level:
+  1. minilm : only paraphrase-multilingual-MiniLM-L12-v2
+  2. jina   : only jina-clip-v1
+  3. mixed  : both at once; concurrency N = N/2 workers per model, sending the SAME texts
+              (e.g. conc 32 -> 16 jina + 16 MiniLM in flight). Each model is reported on its
+              own row, plus a combined row. Needs conc >= 2.
+
   python -m scripts.bench_embedding_service
-  python -m scripts.bench_embedding_service --levels 1,8,32 --requests 200
-  python -m scripts.bench_embedding_service --models minilm        # one model only
-  python -m scripts.bench_embedding_service --models clip,minilm   # default: both
+  python -m scripts.bench_embedding_service --levels 2,8,32 --requests 200
+  python -m scripts.bench_embedding_service --phases mixed
   python -m scripts.bench_embedding_service --url http://embedding.railway.internal:8080
 
 Uses EMBEDDING_SERVICE_URL (the same setting the backend uses) unless --url is given.
@@ -26,8 +32,9 @@ import requests
 
 from core.config import settings
 
-# Short aliases for --models; anything else is passed through as a full model name.
-MODEL_ALIASES = {"clip": settings.CLIP_MODEL, "jina": settings.CLIP_MODEL, "minilm": settings.TEXT_MODEL}
+MINILM = settings.TEXT_MODEL
+JINA = settings.CLIP_MODEL
+PHASES = {"minilm": [MINILM], "jina": [JINA], "mixed": [JINA, MINILM]}
 
 TEXTS = [
     "A golden retriever running through a field of sunflowers",
@@ -74,17 +81,24 @@ def health(base: str) -> dict:
     return r.json()
 
 
-def run_level(base: str, model: str, conc: int, n: int, counter: list):
+def make_texts(counter: list, n: int) -> list:
+    """n unique texts (=> no cache effects); the same list is reused for every model in a level."""
+    out = []
+    for _ in range(n):
+        counter[0] += 1
+        out.append(f"{TEXTS[counter[0] % len(TEXTS)]} {counter[0]}")
+    return out
+
+
+def run_model(base: str, model: str, conc: int, texts: list):
+    """Send every text to `model` with `conc` workers. Returns ([(status, seconds)], wall seconds)."""
     local = threading.local()
-    results = []  # (status, seconds)
+    results = []
     lock = threading.Lock()
 
-    def one(i: int):
+    def one(text: str):
         if not hasattr(local, "s"):  # one keep-alive connection per worker thread
             local.s = requests.Session()
-        with lock:
-            counter[0] += 1
-            text = f"{TEXTS[counter[0] % len(TEXTS)]} {counter[0]}"  # unique => no cache effects
         t = time.perf_counter()
         try:
             code = local.s.post(
@@ -98,57 +112,88 @@ def run_level(base: str, model: str, conc: int, n: int, counter: list):
 
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=conc) as ex:
-        list(ex.map(one, range(n)))
+        list(ex.map(one, texts))
     return results, time.perf_counter() - t0
 
 
-def bench_model(base: str, model: str, levels: list, n_req: int, pause: float) -> None:
-    h = health(base)
-    print(f"\n=== {model} ===")
-    print(f"service dense_model={h.get('dense_model')} queue_max={h.get('queue_max')} rss={h.get('rss_mb')}MB queue={h.get('queue_depth')}")
-    counter = [0]
-    for _ in range(5):  # warm up connections and ONNX
-        requests.post(f"{base}/embed/dense/text", json={"texts": ["warm up"], "model": model}, timeout=60)
+def run_level(base: str, models: list, conc: int, n: int, counter: list) -> list:
+    """One concurrency level. One model: all `conc` workers on it, n requests. Several models:
+    conc split evenly across them, n split evenly, same texts to each, all running at once.
+    Returns [(model, workers, results, wall)]."""
+    per = [conc // len(models) + (i < conc % len(models)) for i in range(len(models))]
+    texts = make_texts(counter, max(1, n // len(models)))
+    out = [None] * len(models)
 
-    print(f"{'conc':>4} {'n':>4} {'ok':>4} {'req/s':>7} | {'mean':>6} {'p50':>6} {'p95':>6} {'p99':>6} {'max':>6} (ms) | not-200 | rss  q-depth")
-    for conc in levels:
-        n = n_req or max(60, conc * 4)
-        results, wall = run_level(base, model, conc, n, counter)
-        ok = [dt * 1000 for code, dt in results if code == 200]
-        bad = dict(Counter(code for code, _ in results if code != 200))
-        h = health(base)
-        stats = (
-            f"{statistics.mean(ok):6.0f} {pct(ok, .5):6.0f} {pct(ok, .95):6.0f} {pct(ok, .99):6.0f} {max(ok):6.0f}"
-            if ok
-            else "     -      -      -      -      -"
-        )
-        print(
-            f"{conc:>4} {len(results):>4} {len(ok):>4} {len(ok) / wall:7.1f} | {stats}      | "
-            f"{bad or '-'} | {h.get('rss_mb')}MB q={h.get('queue_depth')}",
-            flush=True,
-        )
-        time.sleep(pause)
+    def work(i: int):
+        out[i] = (models[i], per[i], *run_model(base, models[i], per[i], texts))
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(len(models))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return out
+
+
+def fmt(results: list, wall: float, h: dict) -> str:
+    ok = [dt * 1000 for code, dt in results if code == 200]
+    bad = dict(Counter(code for code, _ in results if code != 200))
+    stats = (
+        f"{statistics.mean(ok):6.0f} {pct(ok, .5):6.0f} {pct(ok, .95):6.0f} {pct(ok, .99):6.0f} {max(ok):6.0f}"
+        if ok
+        else "     -      -      -      -      -"
+    )
+    return (
+        f"{len(results):>4} {len(ok):>4} {len(ok) / wall:7.1f} | {stats}      | "
+        f"{bad or '-'} | {h.get('rss_mb')}MB q={h.get('queue_depth')}"
+    )
+
+
+def short(model: str) -> str:
+    return "jina" if model == JINA else "minilm" if model == MINILM else model
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default=settings.EMBEDDING_SERVICE_URL)
-    ap.add_argument(
-        "--models",
-        default="clip,minilm",
-        help="comma-separated models: aliases clip/jina (jina-clip-v1), minilm (paraphrase-multilingual-MiniLM-L12-v2), or full model names",
-    )
-    ap.add_argument("--levels", default="1,2,4,8,16,32,64,128", help="comma-separated concurrency levels")
-    ap.add_argument("--requests", type=int, default=0, help="requests per level (default: max(60, 4*concurrency))")
+    ap.add_argument("--phases", default="minilm,jina,mixed", help=f"comma-separated, from {list(PHASES)}")
+    ap.add_argument("--levels", default="1,2,4,8,16,32,64,128", help="comma-separated total concurrency levels")
+    ap.add_argument("--requests", type=int, default=0, help="total requests per level (default: max(60, 4*concurrency)); split evenly in mixed")
     ap.add_argument("--pause", type=float, default=2.0, help="seconds to rest between levels")
     args = ap.parse_args()
     base = args.url.rstrip("/")
     levels = [int(x) for x in args.levels.split(",")]
-    models = [MODEL_ALIASES.get(m.strip().lower(), m.strip()) for m in args.models.split(",") if m.strip()]
+    phases = [p.strip() for p in args.phases.split(",") if p.strip()]
+    for p in phases:
+        if p not in PHASES:
+            ap.error(f"unknown phase {p!r}; choose from {list(PHASES)}")
 
+    h = health(base)
     print(f"target: {base}")
-    for model in models:
-        bench_model(base, model, levels, args.requests, args.pause)
+    print(f"service dense_model={h.get('dense_model')} queue_max={h.get('queue_max')} rss={h.get('rss_mb')}MB queue={h.get('queue_depth')}")
+    counter = [0]
+    header = f"{'conc':>4} {'model':>8} {'work':>4} {'n':>4} {'ok':>4} {'req/s':>7} | {'mean':>6} {'p50':>6} {'p95':>6} {'p99':>6} {'max':>6} (ms) | not-200 | rss  q-depth"
+
+    for phase in phases:
+        models = PHASES[phase]
+        print(f"\n=== phase: {phase} ({' + '.join(short(m) for m in models)}) ===")
+        for m in models:  # warm up connections and ONNX
+            for _ in range(5):
+                requests.post(f"{base}/embed/dense/text", json={"texts": ["warm up"], "model": m}, timeout=60)
+        print(header)
+        for conc in levels:
+            if conc < len(models):
+                print(f"{conc:>4} skipped (needs concurrency >= {len(models)})")
+                continue
+            n = args.requests or max(60, conc * 4)
+            rows = run_level(base, models, conc, n, counter)
+            h = health(base)
+            for model, workers, results, wall in rows:
+                print(f"{conc:>4} {short(model):>8} {workers:>4} " + fmt(results, wall, h), flush=True)
+            if len(rows) > 1:  # combined: all requests over the longer of the two walls
+                allres = [r for _, _, res, _ in rows for r in res]
+                print(f"{conc:>4} {'combined':>8} {conc:>4} " + fmt(allres, max(w for *_, w in rows), h), flush=True)
+            time.sleep(args.pause)
 
     print("\n503 = the service's queue was full (it is protecting itself); latency at high concurrency is mostly queue wait.")
 
