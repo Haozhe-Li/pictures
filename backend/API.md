@@ -124,6 +124,35 @@ Upload an image, generate embeddings (Dense + Sparse), and store metadata.
   }
   ```
 
+### 4.1 Browser-direct upload (presign + ingest staged)
+
+For hosts with request body limits (e.g. Vercel), the file goes browser -> R2 directly,
+then the backend pulls it from R2, processes it and deletes the staged object.
+Both endpoints use the same Basic Auth as `/ingest`.
+
+**Step 1: `POST /upload/presign`** (JSON)
+
+```json
+{ "files": [{ "content_type": "image/jpeg", "size": 5242880 }] }
+```
+
+Allowed types: `image/jpeg`, `image/png`, `image/webp`. Max 50 MB per file, 50 files per call.
+Returns one entry per file; `PUT` the raw file to `upload_url` with the same `Content-Type`
+(URL valid for 15 minutes). The R2 bucket needs a CORS rule allowing `PUT` from the site origin.
+
+```json
+[{ "key": "staging/<uuid>.jpg", "upload_url": "https://...", "content_type": "image/jpeg" }]
+```
+
+**Step 2: `POST /ingest/staged`** (JSON)
+
+```json
+{ "key": "staging/<uuid>.jpg", "title": "...", "description": null, "taken_time": null, "camera": null }
+```
+
+Runs the same pipeline as `/ingest` and returns the same response. Add an R2 lifecycle
+rule expiring the `staging/` prefix (e.g. after 1 day) to clean up uploads that were never ingested.
+
 ## 5. Generate Random Query
 
 Generate a random photo description query using LLM.
@@ -137,6 +166,8 @@ Generate a random photo description query using LLM.
   ```
 
 ## 6. Generate Description (Auto Title & Description)
+
+**Requires Authentication (Basic Auth)**, same credentials as `/ingest`.
 
 Generate a short title and detailed description for an uploaded image.
 

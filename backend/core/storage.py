@@ -28,3 +28,45 @@ def upload_file_to_r2(file_path: str, file_name: str) -> str:
     except Exception as e:
         print(f"Error uploading to R2: {e}")
         raise e
+
+
+# --- Staging area (browser -> R2 direct uploads) ---
+#
+# The browser PUTs the raw file to a presigned URL under STAGING_PREFIX; the
+# backend then pulls it down, processes it, publishes the final WebP files and
+# deletes the staged object. Add an R2 lifecycle rule on this prefix (e.g.
+# expire after 1 day) to sweep up uploads that were never ingested.
+
+STAGING_PREFIX = "staging/"
+
+
+def presign_staging_put(key: str, content_type: str, expires_in: int = 900) -> str:
+    """
+    Returns a presigned PUT URL for `key`. The signature covers Content-Type, so
+    the browser must send exactly the same header.
+    """
+    return s3.generate_presigned_url(
+        "put_object",
+        Params={
+            "Bucket": settings.CF_BUCKET,
+            "Key": key,
+            "ContentType": content_type,
+        },
+        ExpiresIn=expires_in,
+    )
+
+
+def get_object_size(key: str) -> int:
+    """Size in bytes of an object in the bucket. Raises ClientError if missing."""
+    head = s3.head_object(Bucket=settings.CF_BUCKET, Key=key)
+    return head["ContentLength"]
+
+
+def download_object(key: str) -> bytes:
+    """Reads an object from the bucket fully into memory."""
+    obj = s3.get_object(Bucket=settings.CF_BUCKET, Key=key)
+    return obj["Body"].read()
+
+
+def delete_object(key: str) -> None:
+    s3.delete_object(Bucket=settings.CF_BUCKET, Key=key)

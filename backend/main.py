@@ -1,6 +1,7 @@
 import asyncio
 import uuid
 import os
+import re
 import random
 import time
 from typing import Optional, List
@@ -16,6 +17,7 @@ from fastapi import (
     status,
     BackgroundTasks,
 )
+from botocore.exceptions import ClientError
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -29,7 +31,14 @@ import redis.asyncio as redis
 # Imports from Core
 from core.config import settings
 from core.embedding import EmbeddingClient, get_sparse_embedding
-from core.storage import upload_file_to_r2
+from core.storage import (
+    STAGING_PREFIX,
+    delete_object,
+    download_object,
+    get_object_size,
+    presign_staging_put,
+    upload_file_to_r2,
+)
 from core.db import QdrantClientWrapper
 from core.utils import process_image_for_embedding, save_as_webp
 from core.generate_description import description_generator
@@ -196,26 +205,19 @@ class GenerateDescriptionResponse(BaseModel):
 # --- Endpoints ---
 
 
-@app.post("/ingest")
-async def ingest_image(
-    username: str = Depends(verify_credentials),
-    file: UploadFile = File(...),
-    title: str = Form(...),
-    taken_time: Optional[str] = Form(None),
-    camera: Optional[str] = Form(None),
-    description: Optional[str] = Form(None),
+async def _ingest_bytes(
+    file_bytes: bytes,
+    title: str,
+    taken_time: Optional[str],
+    camera: Optional[str],
+    description: Optional[str],
 ):
     """
-    Ingest an image:
-    1. Read and Convert to Base64
-    2. Save Preview & Original Versions to R2
-    3. Get Dense Embedding from the embedding service
-    4. Generate Sparse Embedding from Metadata
-    5. Save to Qdrant
+    Shared ingest pipeline (see /ingest for the steps). Takes the raw image bytes
+    so it works for both multipart uploads and files pulled from the R2 staging area.
     """
     try:
-        # 1. Read file
-        file_bytes = await file.read()
+        # 1. Prepare filenames
         file_uuid = uuid.uuid4()
 
         # Generate filenames for R2 (WebP)
@@ -337,8 +339,133 @@ async def ingest_image(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/ingest")
+async def ingest_image(
+    username: str = Depends(verify_credentials),
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    taken_time: Optional[str] = Form(None),
+    camera: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+):
+    """
+    Ingest an image sent directly as multipart form data:
+    1. Read and Convert to Base64
+    2. Save Preview & Original Versions to R2
+    3. Get Dense Embedding from the embedding service
+    4. Generate Sparse Embedding from Metadata
+    5. Save to Qdrant
+
+    Hosts with request-body limits (e.g. Vercel) cannot use this for large files;
+    use /upload/presign + /ingest/staged instead.
+    """
+    file_bytes = await file.read()
+    return await _ingest_bytes(file_bytes, title, taken_time, camera, description)
+
+
+# --- Browser -> R2 -> backend upload flow ---
+
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+ALLOWED_UPLOAD_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+}
+STAGING_KEY_RE = re.compile(
+    rf"^{re.escape(STAGING_PREFIX)}[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}\.(jpg|png|webp)$"
+)
+
+
+class PresignFile(BaseModel):
+    content_type: str
+    size: int
+
+
+class PresignRequest(BaseModel):
+    files: List[PresignFile]
+
+
+class PresignedUpload(BaseModel):
+    key: str
+    upload_url: str
+    content_type: str
+
+
+class StagedIngestRequest(BaseModel):
+    key: str
+    title: str
+    taken_time: Optional[str] = None
+    camera: Optional[str] = None
+    description: Optional[str] = None
+
+
+@app.post("/upload/presign", response_model=List[PresignedUpload])
+async def presign_uploads(
+    req: PresignRequest, username: str = Depends(verify_credentials)
+):
+    """
+    Issue one presigned R2 PUT URL per file. The browser uploads the raw file
+    straight to R2, then calls /ingest/staged with the returned key.
+    """
+    if not req.files or len(req.files) > 50:
+        raise HTTPException(status_code=400, detail="Provide between 1 and 50 files")
+
+    results = []
+    for f in req.files:
+        ext = ALLOWED_UPLOAD_TYPES.get(f.content_type)
+        if ext is None:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported content type: {f.content_type}"
+            )
+        if f.size <= 0 or f.size > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File size must be between 1 byte and {MAX_UPLOAD_BYTES // 1024 // 1024} MB",
+            )
+        key = f"{STAGING_PREFIX}{uuid.uuid4()}.{ext}"
+        url = await run_in_threadpool(presign_staging_put, key, f.content_type)
+        results.append(PresignedUpload(key=key, upload_url=url, content_type=f.content_type))
+    return results
+
+
+async def _load_staged(key: str) -> bytes:
+    """Validates a staging key and downloads the object (size-checked before reading)."""
+    if not STAGING_KEY_RE.match(key):
+        raise HTTPException(status_code=400, detail="Invalid staging key")
+    try:
+        size = await run_in_threadpool(get_object_size, key)
+    except ClientError:
+        raise HTTPException(status_code=404, detail="Staged upload not found")
+    if size <= 0 or size > MAX_UPLOAD_BYTES:
+        await run_in_threadpool(delete_object, key)
+        raise HTTPException(status_code=413, detail="Staged file has invalid size")
+    return await run_in_threadpool(download_object, key)
+
+
+@app.post("/ingest/staged")
+async def ingest_staged_image(
+    req: StagedIngestRequest, username: str = Depends(verify_credentials)
+):
+    """
+    Ingest an image the browser already uploaded to the R2 staging area: download
+    it, run the normal ingest pipeline, then delete the staged object.
+    """
+    file_bytes = await _load_staged(req.key)
+    result = await _ingest_bytes(
+        file_bytes, req.title, req.taken_time, req.camera, req.description
+    )
+    try:
+        await run_in_threadpool(delete_object, req.key)
+    except Exception as e:
+        # The image is already published; a leftover staged object is swept by the lifecycle rule.
+        print(f"Warning: failed to delete staged object {req.key}: {e}")
+    return result
+
+
 @app.post("/generate-description", response_model=GenerateDescriptionResponse)
-async def generate_description_endpoint(file: UploadFile = File(...)):
+async def generate_description_endpoint(
+    file: UploadFile = File(...), username: str = Depends(verify_credentials)
+):
     """
     Generate title and description for an image using LLM.
     """
