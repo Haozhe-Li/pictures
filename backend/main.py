@@ -614,6 +614,10 @@ async def similar_to_image(request: SimilarToRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Impressions an image gets in the explore pool before it graduates to the hot pool only.
+EXPLORE_GRADUATION_IMPRESSIONS = 10
+
+
 @app.post("/gallery", response_model=GalleryResponse)
 async def get_gallery(request: FeedRequest):
     """
@@ -684,9 +688,9 @@ async def get_gallery(request: FeedRequest):
             await redis_client.zincrby("gallery:pool:explore", 1, cid)
             await redis_client.zincrby("gallery:pool:active", 1, cid)
 
-            # Check graduation: remove from explore pool after 30 impressions
+            # Check graduation: remove from explore pool after enough impressions
             score = await redis_client.zscore("gallery:pool:explore", cid)
-            if score and score >= 30:
+            if score and score >= EXPLORE_GRADUATION_IMPRESSIONS:
                 await redis_client.zrem("gallery:pool:explore", cid)
 
         return GalleryResponse(items=items, next_cursor=None)
