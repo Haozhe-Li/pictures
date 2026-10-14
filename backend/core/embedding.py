@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 import json
 import redis
@@ -7,6 +8,13 @@ from pathlib import Path
 from functools import lru_cache
 from fastembed import SparseTextEmbedding
 from core.config import settings
+
+
+# The embedding service can be cold: the first request after idle may fail with a
+# connection error or a 5xx while it wakes up, then succeed about a second later.
+EMBEDDING_MAX_RETRIES = 2
+EMBEDDING_RETRY_DELAY_SECONDS = 1
+EMBEDDING_RETRYABLE_STATUS = {500, 502, 503, 504}
 
 
 # --- Embedding Service Client (Dense) ---
@@ -92,6 +100,40 @@ class EmbeddingClient:
 
         return embedding
 
+    def _post_with_retry(self, path: str, payload: Dict[str, Any]) -> requests.Response:
+        """
+        POST to the embedding service, retrying cold-start failures after a short sleep.
+
+        Retried: connection errors/timeouts and 5xx responses. Not retried: 4xx (the request
+        itself is wrong) and read timeouts (the service accepted the request and is slow, so
+        retrying would only stack up 60s waits). Raises the last error if all attempts fail,
+        or returns the last response so the caller can report its status.
+        """
+        for attempt in range(EMBEDDING_MAX_RETRIES + 1):
+            is_last = attempt == EMBEDDING_MAX_RETRIES
+            try:
+                response = self.session.post(
+                    f"{self.base_url}{path}", json=payload, timeout=(5, 60)
+                )
+            except requests.exceptions.ConnectionError as e:
+                # ConnectTimeout is a subclass of ConnectionError.
+                if is_last:
+                    raise
+                reason = f"{type(e).__name__}"
+            else:
+                if response.status_code not in EMBEDDING_RETRYABLE_STATUS or is_last:
+                    return response
+                reason = f"HTTP {response.status_code}"
+
+            print(
+                f"Embedding service not ready ({reason}) on {path}; "
+                f"retrying in {EMBEDDING_RETRY_DELAY_SECONDS}s "
+                f"(attempt {attempt + 1}/{EMBEDDING_MAX_RETRIES})"
+            )
+            time.sleep(EMBEDDING_RETRY_DELAY_SECONDS)
+
+        raise RuntimeError("unreachable")  # loop always returns or raises
+
     def _execute_embedding_request(
         self,
         text: Optional[str] = None,
@@ -109,9 +151,7 @@ class EmbeddingClient:
         else:
             raise ValueError("No input provided")
 
-        response = self.session.post(
-            f"{self.base_url}{path}", json=payload, timeout=(5, 60)
-        )
+        response = self._post_with_retry(path, payload)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
