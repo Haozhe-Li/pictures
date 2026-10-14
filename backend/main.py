@@ -15,7 +15,6 @@ from fastapi import (
     HTTPException,
     Depends,
     status,
-    BackgroundTasks,
 )
 from botocore.exceptions import ClientError
 from fastapi.concurrency import run_in_threadpool
@@ -64,7 +63,13 @@ async def lifespan(app: FastAPI):
 
     # Startup: Initialize Qdrant Collection
     await qdrant_wrapper.init_collection()
+    decay_task = asyncio.create_task(_decay_loop())
     yield
+    decay_task.cancel()
+    try:
+        await decay_task
+    except asyncio.CancelledError:
+        pass
     await redis_client.close()
     await qdrant_wrapper.client.close()
 
@@ -743,7 +748,7 @@ async def _decay_active_pool():
     """
     Multiplicatively decay every score in the active pool.
 
-    Runs out of the request path (via BackgroundTasks) and batches writes into
+    Runs from a background loop (not in a request) and batches writes into
     pipelines, so a large pool cannot stall the caller.
     """
     try:
@@ -772,24 +777,39 @@ async def _decay_active_pool():
         print(f"Decay Error: {e}")
 
 
-@app.get("/health")
-async def health_check(background_tasks: BackgroundTasks):
-    """
-    Health check endpoint, also used as a trigger for heat decay cron.
-    """
-    try:
-        # SET NX EX is atomic, so exactly one worker wins each decay window even
-        # when several health checks arrive at the same moment. The key expiring
-        # is what re-opens the window.
-        acquired = await redis_client.set(
-            "gallery:decay:lock",
-            time.time(),
-            nx=True,
-            ex=DECAY_INTERVAL_SECONDS,
-        )
-        if acquired:
-            background_tasks.add_task(_decay_active_pool)
-    except Exception as e:
-        print(f"Decay scheduling error: {e}")
+DECAY_CHECK_INTERVAL_SECONDS = 600  # How often the background loop tries to open a window
 
+
+async def _acquire_decay_window() -> bool:
+    """
+    SET NX EX is atomic, so exactly one caller wins each decay window, even across
+    processes, replicas and concurrent /health hits. The key expiring re-opens it.
+    """
+    acquired = await redis_client.set(
+        "gallery:decay:lock",
+        time.time(),
+        nx=True,
+        ex=DECAY_INTERVAL_SECONDS,
+    )
+    return bool(acquired)
+
+
+async def _decay_loop():
+    """
+    Background scheduler: wake up periodically and decay the active pool whenever the
+    window is open. Because the lock outlives restarts, redeploying does not cause
+    extra decays, and a restart after a long outage catches up immediately.
+    """
+    while True:
+        try:
+            if await _acquire_decay_window():
+                await _decay_active_pool()
+        except Exception as e:
+            print(f"Decay loop error: {e}")
+        await asyncio.sleep(DECAY_CHECK_INTERVAL_SECONDS)
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
     return {"status": "ok"}
