@@ -200,6 +200,19 @@ class QdrantClientWrapper:
         )
         return points[0] if points else None
 
+    async def get_points(self, point_ids: List[str]):
+        """
+        Fetch several points by ID (payload only). Unknown IDs are silently skipped.
+        """
+        if not point_ids:
+            return []
+        return await self.client.retrieve(
+            collection_name=settings.COLLECTION_NAME,
+            ids=point_ids,
+            with_payload=True,
+            with_vectors=False,
+        )
+
     @staticmethod
     def normalize_sparse_vector(sparse_vector: Any) -> Dict[str, Any]:
         """

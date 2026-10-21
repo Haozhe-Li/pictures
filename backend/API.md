@@ -155,13 +155,19 @@ rule expiring the `staging/` prefix (e.g. after 1 day) to clean up uploads that 
 
 ## 5. Generate Random Query
 
-Generate a random photo description query using LLM.
+Get a random search query that is guaranteed to be grounded in the gallery.
+
+Queries come from a Redis queue (`random_query:queue`). A refill samples random images,
+has a small LLM rewrite each title + description into a short search query, and warms the
+query's embeddings into the embedding cache so the follow-up `/search` is fast. Each call
+pops one query; when 5 or fewer remain, 10 more are added in the background. If the queue is
+empty or Redis/LLM fails, a query from a small static list is returned instead.
 
 - **URL**: `GET /generate-random-query`
 - **Response Example**:
   ```json
   {
-    "query": "A golden retriever running on the beach at sunset"
+    "query": "daylight lingers on wisconsin autumn"
   }
   ```
 

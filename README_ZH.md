@@ -298,7 +298,7 @@ gallery_RAG/
 - `GET /gallery` — 获取所有图库图像
 - `POST /search` — 按文本查询搜索图像
 - `POST /similar` — 按图像 URL 查找相似图像
-- `GET /random-query` — 获取随机搜索建议
+- `GET /generate-random-query` — 获取随机搜索建议
 - `POST /ingest` — 上传并处理新图像（仅管理员）
 
 有关详细的请求/响应架构和示例，请参阅 [API 文档](backend/API.md)。

@@ -64,6 +64,10 @@ class EmbeddingClient:
             text, image_url, image_base64, is_query=is_query, model=model
         )
 
+    @staticmethod
+    def text_cache_key(text: str, model: str) -> str:
+        return f"embedding:{model}:{text}"
+
     @lru_cache(maxsize=1024)
     def _get_cached_text_embedding(self, text: str, model: str) -> List[float]:
         """
@@ -74,7 +78,7 @@ class EmbeddingClient:
         Keyed by model: vectors from different models must never be mixed up.
         """
         dim = settings.EMBEDDING_DIMS[model]
-        redis_key = f"embedding:{model}:{text}"
+        redis_key = self.text_cache_key(text, model)
         # Checks Redis before hitting API
         if self.redis_client:
             try:
