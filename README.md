@@ -298,7 +298,7 @@ Comprehensive API documentation is available at [backend/API.md](backend/API.md)
 - `GET /gallery` — Retrieve all gallery images
 - `POST /search` — Search images by text query
 - `POST /similar` — Find similar images by image URL
-- `GET /random-query` — Get random search suggestions
+- `GET /generate-random-query` — Get random search suggestions
 - `POST /ingest` — Upload and process new images (admin only)
 
 For detailed request/response schemas and examples, see the [API documentation](backend/API.md).

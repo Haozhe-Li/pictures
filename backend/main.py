@@ -21,7 +21,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
-from core.random_query import generate_random_query
+from core.random_query import RandomQueryManager
 import secrets
 import json
 from enum import Enum
@@ -54,6 +54,7 @@ redis_client = redis.Redis.from_url(
     settings.REDIS_URL,
     decode_responses=True,
 )
+random_query_manager = RandomQueryManager(redis_client, qdrant_wrapper, embedding_client)
 
 
 @asynccontextmanager
@@ -64,12 +65,15 @@ async def lifespan(app: FastAPI):
     # Startup: Initialize Qdrant Collection
     await qdrant_wrapper.init_collection()
     decay_task = asyncio.create_task(_decay_loop())
+    # Fill the random-query queue in the background so the first click is already served from it
+    await random_query_manager.warm_up()
     yield
     decay_task.cancel()
     try:
         await decay_task
     except asyncio.CancelledError:
         pass
+    await random_query_manager.close()
     await redis_client.close()
     await qdrant_wrapper.client.close()
 
@@ -729,10 +733,12 @@ async def interact_image(request: InteractRequest):
 @app.get("/generate-random-query")
 async def generate_random_query_endpoint():
     """
-    Generate a random photo description query using LLM.
+    Pop a random search query from the Redis queue. Queries are LLM-rewritten from the
+    title + description of random gallery images, with their embeddings pre-warmed.
+    Falls back to a static list if the queue is empty or unavailable.
     """
     try:
-        query = await generate_random_query()
+        query = await random_query_manager.next_query()
         return {"query": query}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
