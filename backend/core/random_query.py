@@ -1,7 +1,7 @@
 import asyncio
 import json
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from core.config import settings
 from core.embedding import EmbeddingClient
@@ -18,15 +18,12 @@ IMAGE_POOL_KEY = "gallery:pool:active"  # ZSET holding every ingested image id
 
 REFILL_THRESHOLD = 5  # refill once the queue is down to this many items
 REFILL_BATCH = 10  # items added per refill
-REFILL_LOCK_TTL_SECONDS = 120  # upper bound on one refill; guards against a crashed worker
+REFILL_LOCK_TTL_SECONDS = 300  # upper bound on one refill; guards against a crashed worker
 REFILL_FAILURE_COOLDOWN_SECONDS = 30  # back off after a failed refill instead of retrying per click
 
 # Queued queries can wait a long time on a quiet site, so keep their cached embeddings
 # around much longer than the queue is expected to take to drain.
 EMBEDDING_CACHE_TTL_SECONDS = 7 * 24 * 3600
-# The embedding service can take longer than the client's own short retry to wake up.
-# This runs in the background, so back off generously.
-WARM_RETRY_DELAYS_SECONDS = (2, 4)
 
 QUERY_SYSTEM_PROMPT = """You turn photo titles and descriptions into short search queries, the way a person would type them into a photo library search box.
 
@@ -145,7 +142,10 @@ class RandomQueryManager:
         added = 0
         for image, query in zip(images, queries):
             if not await self._warm_embeddings(query):
-                continue  # a cold-start click would defeat the point of queueing it
+                # The client already retried for ~30s, so the embedding service is down:
+                # trying the rest of the batch would only repeat that wait per query.
+                print("Random query refill: embedding service unavailable, stopping batch")
+                break
             item = json.dumps({"query": query, "image_id": image["id"]})
             await self.redis.rpush(QUEUE_KEY, item)
             added += 1
@@ -223,32 +223,19 @@ class RandomQueryManager:
     async def _warm_embeddings(self, query: str) -> bool:
         """
         Embed the query with both models `/search` uses, so the results land in the
-        embedding cache. Retries because the embedding service may be cold.
+        embedding cache. The client retries cold-start failures itself; False means it
+        gave up, and the query must not be queued (clicking it would hit a cold service).
         """
         for model in (settings.CLIP_MODEL, settings.TEXT_MODEL):
-            if not await self._embed_with_retry(query, model):
+            try:
+                await asyncio.to_thread(
+                    self.embedding_client.get_embedding, text=query, model=model
+                )
+            except Exception as e:
+                print(f"Random query embedding failed ({model}): '{query}': {e}")
                 return False
             # Warmed entries get a TTL so one-off random queries don't pile up forever.
             await self.redis.expire(
                 EmbeddingClient.text_cache_key(query, model), EMBEDDING_CACHE_TTL_SECONDS
             )
         return True
-
-    async def _embed_with_retry(self, query: str, model: str) -> bool:
-        delays: List[Optional[int]] = [*WARM_RETRY_DELAYS_SECONDS, None]
-        for attempt, delay in enumerate(delays, 1):
-            try:
-                await asyncio.to_thread(
-                    self.embedding_client.get_embedding, text=query, model=model
-                )
-                return True
-            except Exception as e:
-                if delay is None:
-                    print(f"Random query embedding gave up ({model}): '{query}': {e}")
-                    return False
-                print(
-                    f"Random query embedding failed (attempt {attempt}/{len(delays)}): {e}; "
-                    f"retrying in {delay}s"
-                )
-                await asyncio.sleep(delay)
-        return False

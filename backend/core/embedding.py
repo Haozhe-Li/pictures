@@ -11,10 +11,14 @@ from core.config import settings
 
 
 # The embedding service can be cold: the first request after idle may fail with a
-# connection error or a 5xx while it wakes up, then succeed about a second later.
-EMBEDDING_MAX_RETRIES = 2
-EMBEDDING_RETRY_DELAY_SECONDS = 1
-EMBEDDING_RETRYABLE_STATUS = {500, 502, 503, 504}
+# connection error or an error status while it wakes up (which status depends on the
+# proxy/platform in front of it: 5xx, 404, 408, 429, ...), then succeed once it is up.
+#
+# Waking up can take several seconds, so retry generously: one sleep per retry, ~28s in total.
+EMBEDDING_RETRY_DELAYS_SECONDS = (2, 3, 4, 5, 6, 8)
+# Any non-2xx status is retried except these, where our request itself is wrong and
+# retrying would only delay the error.
+EMBEDDING_NON_RETRYABLE_STATUS = {400, 413, 422}
 
 
 # --- Embedding Service Client (Dense) ---
@@ -108,13 +112,15 @@ class EmbeddingClient:
         """
         POST to the embedding service, retrying cold-start failures after a short sleep.
 
-        Retried: connection errors/timeouts and 5xx responses. Not retried: 4xx (the request
-        itself is wrong) and read timeouts (the service accepted the request and is slow, so
-        retrying would only stack up 60s waits). Raises the last error if all attempts fail,
-        or returns the last response so the caller can report its status.
+        Retried: connection errors/timeouts and any error status (>= 400) other than
+        EMBEDDING_NON_RETRYABLE_STATUS. Not retried: those request errors, and read timeouts
+        (the service accepted the request and is slow, so retrying would only stack up 60s
+        waits). Raises the last error if all attempts fail, or returns the last response so
+        the caller can report its status.
         """
-        for attempt in range(EMBEDDING_MAX_RETRIES + 1):
-            is_last = attempt == EMBEDDING_MAX_RETRIES
+        max_retries = len(EMBEDDING_RETRY_DELAYS_SECONDS)
+        for attempt in range(max_retries + 1):
+            is_last = attempt == max_retries
             try:
                 response = self.session.post(
                     f"{self.base_url}{path}", json=payload, timeout=(5, 60)
@@ -125,16 +131,17 @@ class EmbeddingClient:
                     raise
                 reason = f"{type(e).__name__}"
             else:
-                if response.status_code not in EMBEDDING_RETRYABLE_STATUS or is_last:
+                status = response.status_code
+                if status < 400 or status in EMBEDDING_NON_RETRYABLE_STATUS or is_last:
                     return response
-                reason = f"HTTP {response.status_code}"
+                reason = f"HTTP {status}"
 
+            delay = EMBEDDING_RETRY_DELAYS_SECONDS[attempt]
             print(
                 f"Embedding service not ready ({reason}) on {path}; "
-                f"retrying in {EMBEDDING_RETRY_DELAY_SECONDS}s "
-                f"(attempt {attempt + 1}/{EMBEDDING_MAX_RETRIES})"
+                f"retrying in {delay}s (retry {attempt + 1}/{max_retries})"
             )
-            time.sleep(EMBEDDING_RETRY_DELAY_SECONDS)
+            time.sleep(delay)
 
         raise RuntimeError("unreachable")  # loop always returns or raises
 
