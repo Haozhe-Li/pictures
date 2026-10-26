@@ -21,6 +21,7 @@ EMBEDDING_RETRY_DELAYS_SECONDS = (2, 3, 4, 5, 6, 8)
 EMBEDDING_NON_RETRYABLE_STATUS = {400, 413, 422}
 
 
+
 # --- Embedding Service Client (Dense) ---
 class EmbeddingClient:
     def __init__(self):
