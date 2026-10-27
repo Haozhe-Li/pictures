@@ -254,3 +254,73 @@ Get details for a specific image by its UUID.
     }
   }
   ```
+
+## 11. Admin: Manage Images
+
+All endpoints below **require Authentication (Basic Auth)**, same credentials as `/ingest`.
+
+### 11.1 List Images
+
+Stable, paginated listing of every image (`/gallery` is a random feed and cannot be paged reliably).
+
+- **URL**: `GET /admin/images`
+- **Query Parameters**:
+  - `limit` (int, optional): 1-100. Default: 40.
+  - `cursor` (string, optional): `next_cursor` from the previous page.
+- **Response Example**:
+  ```json
+  {
+    "items": [
+      {
+        "id": "uuid-string",
+        "preview_url": "https://cdn.haozheli.com/uuid_preview.webp",
+        "original_url": "https://cdn.haozheli.com/uuid_original.webp",
+        "score": 1.0,
+        "metadata": { "title": "Summer Beach", "description": "Fun times", "taken_time": "2023-08-01", "camera": "Sony A7M4", "type": "image" }
+      }
+    ],
+    "next_cursor": "uuid-of-next-page-or-null",
+    "total": 128
+  }
+  ```
+
+### 11.2 Update Metadata
+
+- **URL**: `PATCH /admin/images/{image_id}`
+- **Request Body (JSON)**: any of `title`, `description`, `taken_time`, `camera`.
+  Omitted or `null` fields are left unchanged; an empty string clears an optional field;
+  `title` can never be empty (400).
+- **Re-embedding**: the title, description, taken time and camera are all part of the indexed
+  text, so any change recomputes the `sparse` and `dense-text` vectors (the `dense-image`
+  vector is untouched). The vectors and payload are written in a single Qdrant request, and
+  embeddings are computed first, so a failed embedding changes nothing. A request that changes
+  nothing returns immediately without re-embedding.
+- **Response**: the updated image, in the same shape as an item of `/admin/images`.
+- **Errors**: `404` unknown id, `400` blank title.
+
+### 11.3 Delete Image
+
+Removes the Qdrant point, its entries in the Redis recommendation pools and click/share
+counters, and the preview and original files in R2. Not reversible.
+
+- **URL**: `DELETE /admin/images/{image_id}`
+- **Response Example**:
+  ```json
+  { "status": "deleted", "id": "uuid-string", "warnings": [] }
+  ```
+  The point is deleted first, so the image disappears from the gallery immediately. If the
+  Redis or R2 cleanup fails afterwards the request still succeeds and `warnings` lists what
+  was left behind. Only files named `<uuid>_preview.webp` / `<uuid>_original.webp` under the
+  public CDN base URL are ever deleted from R2.
+- **Errors**: `404` unknown id.
+- **Not reflected automatically**: the autocomplete index (see 9) and copies already cached at
+  the CDN edge.
+
+### 11.4 Describe a Published Image
+
+Like `/generate-description`, but for an image that is already published (reads the stored
+original from R2).
+
+- **URL**: `POST /admin/images/{image_id}/describe`
+- **Response**: `{ "title": "...", "description": "..." }`
+- **Errors**: `404` unknown id or missing original.

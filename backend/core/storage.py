@@ -1,6 +1,7 @@
 import boto3
 from botocore.config import Config
 import os
+import re
 from typing import Optional
 from core.config import settings
 
@@ -70,3 +71,22 @@ def download_object(key: str) -> bytes:
 
 def delete_object(key: str) -> None:
     s3.delete_object(Bucket=settings.CF_BUCKET, Key=key)
+
+
+# --- Published objects (what the gallery serves) ---
+
+# Ingest always publishes `<uuid>_preview.webp` and `<uuid>_original.webp`. Deleting is
+# restricted to that shape so a bad payload can never remove anything else in the bucket.
+PUBLISHED_KEY_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_(preview|original)\.webp$")
+
+
+def key_from_public_url(url: Optional[str]) -> Optional[str]:
+    """
+    Maps a public CDN URL back to its bucket key, or None when the URL is not one of
+    our published image files.
+    """
+    base_url = settings.CLOUDFLARE_FREE_URL
+    if not url or not url.startswith(base_url):
+        return None
+    key = url[len(base_url):]
+    return key if PUBLISHED_KEY_RE.match(key) else None

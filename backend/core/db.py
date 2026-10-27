@@ -161,6 +161,56 @@ class QdrantClientWrapper:
         )
         return points, next_offset
 
+    async def count(self) -> int:
+        """Total number of points in the collection."""
+        result = await self.client.count(
+            collection_name=settings.COLLECTION_NAME, exact=True
+        )
+        return result.count
+
+    async def update_metadata(
+        self,
+        point_id: str,
+        text_dense_vector: List[float],
+        sparse_vector: Dict[str, Any],
+        payload: Dict[str, Any],
+    ):
+        """
+        Replace the metadata-derived vectors and merge `payload` into the point.
+        `dense-image` is left untouched. Both operations go out in one request so a
+        failure cannot leave the payload and its vectors out of step.
+        """
+        await self.client.batch_update_points(
+            collection_name=settings.COLLECTION_NAME,
+            update_operations=[
+                models.UpdateVectorsOperation(
+                    update_vectors=models.UpdateVectors(
+                        points=[
+                            models.PointVectors(
+                                id=point_id,
+                                vector={
+                                    "dense-text": text_dense_vector,
+                                    "sparse": models.SparseVector(
+                                        indices=sparse_vector["indices"],
+                                        values=sparse_vector["values"],
+                                    ),
+                                },
+                            )
+                        ]
+                    )
+                ),
+                models.SetPayloadOperation(
+                    set_payload=models.SetPayload(payload=payload, points=[point_id])
+                ),
+            ],
+        )
+
+    async def delete_point(self, point_id: str):
+        await self.client.delete(
+            collection_name=settings.COLLECTION_NAME,
+            points_selector=models.PointIdsList(points=[point_id]),
+        )
+
     async def find_point_by_image_url(self, image_url: str):
         """
         Find a point by matching preview_url or original_url in payload.
