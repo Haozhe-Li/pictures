@@ -18,6 +18,12 @@ class Settings:
     # incompatible, so it lives in a different collection (see scripts/migrate_text_model.py).
     COLLECTION_NAME = "gallery_rag_hybrid_v2"
     LEGACY_COLLECTION_NAME = "gallery_rag_hybrid"
+    # User-facing "collections" (albums). Each one is a point in its own Qdrant collection whose
+    # title+description embedding is the anchor that new images are matched against.
+    GALLERY_COLLECTIONS_NAME = "gallery_collections"
+    # Cosine score on `dense-text` above which an image joins a collection. Each collection can
+    # override it; this is the default a new one starts with.
+    DEFAULT_COLLECTION_THRESHOLD = float(os.getenv("COLLECTION_DEFAULT_THRESHOLD", "0.5"))
 
     # Self-hosted embedding service. Two dense models, each with its own job:
     #  - CLIP: text query <-> image (`dense-image`) and image <-> image. Shared text/image space.

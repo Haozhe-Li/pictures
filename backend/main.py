@@ -21,7 +21,7 @@ from botocore.exceptions import ClientError
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from core.random_query import RandomQueryManager
 import secrets
 import json
@@ -44,6 +44,7 @@ from core.db import QdrantClientWrapper
 from core.utils import process_image_for_embedding, save_as_webp
 from core.generate_description import description_generator
 from core.autocomplete import autocomplete_manager
+from core import gallery_collections as gc
 
 async def _none():
     return None
@@ -244,10 +245,14 @@ async def _ingest_bytes(
     taken_time: Optional[str],
     camera: Optional[str],
     description: Optional[str],
+    collection_ids: Optional[List[str]] = None,
 ):
     """
     Shared ingest pipeline (see /ingest for the steps). Takes the raw image bytes
     so it works for both multipart uploads and files pulled from the R2 staging area.
+
+    `collection_ids` is the admin's explicit choice of collections ([] = none, and it sticks);
+    None lets the server match the new image against the collections' anchors.
     """
     try:
         # 1. Prepare filenames
@@ -315,7 +320,14 @@ async def _ingest_bytes(
             title, description, taken_time, camera
         )
 
-        # 5. Qdrant Upsert
+        # 5. Collections: the admin's explicit choice, or whatever matches the anchors
+        if collection_ids is None:
+            member_ids = await _auto_collections(text_dense_embedding)
+            membership = gc.membership_payload(member_ids, by_admin=False)
+        else:
+            membership = gc.membership_payload(collection_ids, by_admin=True)
+
+        # 6. Qdrant Upsert
         point_id = str(file_uuid)
         payload = {
             "title": title,
@@ -325,6 +337,7 @@ async def _ingest_bytes(
             "preview_url": r2_url_preview,
             "original_url": r2_url_original,
             "type": "image",
+            **membership,
         }
 
         await qdrant_wrapper.upsert_point(
@@ -335,11 +348,11 @@ async def _ingest_bytes(
             payload=payload,
         )
 
-        # 6. Add to Redis Pools for Waterfall Recommendation
+        # 7. Add to Redis Pools for Waterfall Recommendation
         await redis_client.zadd("gallery:pool:active", {point_id: 0})
         await redis_client.zadd("gallery:pool:explore", {point_id: 0})
 
-        # 7. New title/description text: refresh the autocomplete index after a quiet period
+        # 8. New title/description text: refresh the autocomplete index after a quiet period
         autocomplete_manager.schedule_rebuild()
 
         return {
@@ -348,6 +361,7 @@ async def _ingest_bytes(
             "preview_url": r2_url_preview,
             "original_url": r2_url_original,
             "metadata_used_for_sparse": metadata_text,
+            "collection_ids": membership["collection_ids"],
         }
 
     except HTTPException as he:
@@ -415,6 +429,8 @@ class StagedIngestRequest(BaseModel):
     taken_time: Optional[str] = None
     camera: Optional[str] = None
     description: Optional[str] = None
+    # Explicit collections ([] = none); omit to let the server match the anchors
+    collection_ids: Optional[List[str]] = None
 
 
 @app.post("/upload/presign", response_model=List[PresignedUpload])
@@ -468,9 +484,19 @@ async def ingest_staged_image(
     Ingest an image the browser already uploaded to the R2 staging area: download
     it, run the normal ingest pipeline, then delete the staged object.
     """
+    collection_ids = None
+    if req.collection_ids is not None:
+        # Reject unknown collections before downloading and publishing anything
+        collection_ids = gc.dedupe(req.collection_ids)
+        await _require_collections(collection_ids)
     file_bytes = await _load_staged(req.key)
     result = await _ingest_bytes(
-        file_bytes, req.title, req.taken_time, req.camera, req.description
+        file_bytes,
+        req.title,
+        req.taken_time,
+        req.camera,
+        req.description,
+        collection_ids,
     )
     try:
         await run_in_threadpool(delete_object, req.key)
@@ -534,6 +560,9 @@ class ImageUpdateRequest(BaseModel):
     description: Optional[str] = None
     taken_time: Optional[str] = None
     camera: Optional[str] = None
+    # Explicit collections ([] = none, and it sticks); omit to leave them as they are
+    # (an image with none is matched against the anchors when its text changes)
+    collection_ids: Optional[List[str]] = None
 
 
 EDITABLE_FIELDS = ("title", "description", "taken_time", "camera")
@@ -634,23 +663,47 @@ async def admin_update_image(
             updates[field] = value or None
 
     changed = {k: v for k, v in updates.items() if payload.get(k) != v}
-    if not changed:
+
+    # Explicit membership from the admin; validated before anything is written
+    membership: dict = {}
+    if req.collection_ids is not None:
+        ids = gc.dedupe(req.collection_ids)
+        await _require_collections(ids)
+        wanted = gc.membership_payload(ids, by_admin=True)
+        if wanted != {
+            "collection_ids": gc.current_membership(payload),
+            "collections_opt_out": bool(payload.get("collections_opt_out")),
+        }:
+            membership = wanted
+
+    if not changed and not membership:
         return _to_search_result(image_id, payload)
 
     merged = {**payload, **changed}
-    # Embed first: if the embedding service fails nothing has been written yet.
-    _, sparse_vec, text_dense_embedding = await _embed_metadata(
-        merged.get("title", ""),
-        merged.get("description"),
-        merged.get("taken_time"),
-        merged.get("camera"),
-    )
-    await qdrant_wrapper.update_metadata(
-        point_id=image_id,
-        text_dense_vector=text_dense_embedding,
-        sparse_vector=sparse_vec,
-        payload=changed,
-    )
+    if changed:
+        # Embed first: if the embedding service fails nothing has been written yet.
+        _, sparse_vec, text_dense_embedding = await _embed_metadata(
+            merged.get("title", ""),
+            merged.get("description"),
+            merged.get("taken_time"),
+            merged.get("camera"),
+        )
+        # New text for an image that is in no collection (and has not opted out): match it
+        if req.collection_ids is None and gc.is_auto_eligible(payload):
+            matched = await _auto_collections(text_dense_embedding)
+            if matched:
+                membership = gc.membership_payload(matched, by_admin=False)
+        merged.update(membership)
+        await qdrant_wrapper.update_metadata(
+            point_id=image_id,
+            text_dense_vector=text_dense_embedding,
+            sparse_vector=sparse_vec,
+            payload={**changed, **membership},
+        )
+    else:
+        merged.update(membership)
+        await qdrant_wrapper.set_membership({image_id: membership})
+
     # Autocomplete is built from titles and descriptions only
     if "title" in changed or "description" in changed:
         autocomplete_manager.schedule_rebuild()
@@ -723,6 +776,467 @@ async def admin_describe_image(
     except ClientError:
         raise HTTPException(status_code=404, detail="Original file not found")
     return await _describe_bytes(file_bytes)
+
+
+# --- Admin: collections ---
+#
+# A collection is a user-facing group of images. Its title+description is embedded like an
+# image's text (`dense-text` MiniLM + `sparse` BM25) and kept as the collection's anchor in a
+# separate Qdrant collection; the images carry their membership in `collection_ids`.
+# Only the dense score decides automatic assignment (BM25 scores have no fixed scale).
+
+
+class CollectionInfo(BaseModel):
+    id: str
+    title: str
+    description: Optional[str] = None
+    threshold: float
+    image_count: int
+    # Admin-chosen cover; when unset the cover is simply the first image of the collection
+    cover_image_id: Optional[str] = None
+    cover_preview_url: Optional[str] = None
+
+
+class CollectionMatch(BaseModel):
+    id: str
+    title: str
+    score: float
+    threshold: float
+    matched: bool
+
+
+class CollectionCreateRequest(BaseModel):
+    title: str
+    description: Optional[str] = None
+    threshold: Optional[float] = Field(None, ge=0, le=1)
+    # Images to put in right away (what the admin ticked on the review screen)
+    image_ids: List[str] = []
+
+
+class CollectionUpdateRequest(BaseModel):
+    """Partial update; an empty `description` or `cover_image_id` clears it."""
+
+    title: Optional[str] = None
+    description: Optional[str] = None
+    threshold: Optional[float] = Field(None, ge=0, le=1)
+    cover_image_id: Optional[str] = None
+
+
+class CollectionPreviewRequest(BaseModel):
+    title: str
+    description: Optional[str] = None
+    limit: int = Field(200, ge=1, le=500)
+    min_score: float = Field(0.2, ge=-1, le=1)
+
+
+class CollectionPreviewResponse(BaseModel):
+    # Existing images ranked by similarity to the draft collection. `metadata` carries each
+    # image's current `collection_ids`, so the UI can tell which ones are already placed.
+    items: List[SearchResult]
+    default_threshold: float
+
+
+class SuggestRequest(BaseModel):
+    title: str
+    description: Optional[str] = None
+    taken_time: Optional[str] = None
+    camera: Optional[str] = None
+
+
+class MembershipRequest(BaseModel):
+    image_ids: List[str]
+    add: List[str] = []
+    remove: List[str] = []
+
+
+class MembershipItem(BaseModel):
+    id: str
+    collection_ids: List[str]
+    collections_opt_out: bool
+
+
+class MembershipResponse(BaseModel):
+    updated: List[MembershipItem]
+    missing: List[str]
+
+
+MAX_MEMBERSHIP_IMAGES = 1000
+
+
+def _collection_threshold(payload: dict) -> float:
+    value = payload.get("threshold")
+    return settings.DEFAULT_COLLECTION_THRESHOLD if value is None else float(value)
+
+
+async def _require_collection(collection_id: str):
+    try:
+        point = await qdrant_wrapper.get_gallery_collection(collection_id)
+    except Exception:
+        # Qdrant rejects ids that are neither integers nor UUIDs
+        raise HTTPException(status_code=404, detail="Collection not found")
+    if not point:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    return point
+
+
+async def _require_collections(ids: List[str]):
+    """400 unless every id is an existing collection."""
+    if not ids:
+        return
+    known = {str(p.id) for p in await qdrant_wrapper.list_gallery_collections()}
+    unknown = [i for i in ids if i not in known]
+    if unknown:
+        raise HTTPException(
+            status_code=400, detail=f"Unknown collection(s): {', '.join(unknown)}"
+        )
+
+
+async def _score_collections(text_vector: List[float]) -> List[CollectionMatch]:
+    """Every collection scored against an image's text vector, best first."""
+    points = await qdrant_wrapper.score_gallery_collections(text_vector)
+    matches = []
+    for p in points:
+        payload = p.payload or {}
+        threshold = _collection_threshold(payload)
+        matches.append(
+            CollectionMatch(
+                id=str(p.id),
+                title=payload.get("title", ""),
+                score=p.score,
+                threshold=threshold,
+                matched=p.score >= threshold,
+            )
+        )
+    return matches
+
+
+async def _auto_collections(text_vector: List[float]) -> List[str]:
+    """
+    Ids of the collections an image matches. Matching is a convenience: if it fails the
+    image simply lands in none rather than the upload or edit failing.
+    """
+    try:
+        return [m.id for m in await _score_collections(text_vector) if m.matched]
+    except Exception as e:
+        print(f"Warning: collection matching failed: {e}")
+        return []
+
+
+def _clean_image_ids(ids: List[str]) -> List[str]:
+    ids = gc.dedupe(ids)
+    if len(ids) > MAX_MEMBERSHIP_IMAGES:
+        raise HTTPException(
+            status_code=400, detail=f"At most {MAX_MEMBERSHIP_IMAGES} images at a time"
+        )
+    for i in ids:
+        try:
+            uuid.UUID(i)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid image id: {i}")
+    return ids
+
+
+async def _fetch_images(ids: List[str]) -> dict:
+    """id -> payload for the images that exist (unknown ids are left out)."""
+    found = {}
+    for i in range(0, len(ids), 200):
+        for p in await qdrant_wrapper.get_points(ids[i : i + 200]):
+            found[str(p.id)] = p.payload or {}
+    return found
+
+
+async def _change_membership(
+    image_ids: List[str], add: List[str], remove: List[str], by_admin: bool = True
+) -> MembershipResponse:
+    images = await _fetch_images(image_ids)
+    memberships = {}
+    for image_id, payload in images.items():
+        new_ids = gc.apply_membership(gc.current_membership(payload), add, remove)
+        memberships[image_id] = gc.membership_payload(new_ids, by_admin)
+    if memberships:
+        await qdrant_wrapper.set_membership(memberships)
+    return MembershipResponse(
+        updated=[
+            MembershipItem(
+                id=i,
+                collection_ids=m["collection_ids"],
+                collections_opt_out=m["collections_opt_out"],
+            )
+            for i, m in memberships.items()
+        ],
+        missing=[i for i in image_ids if i not in images],
+    )
+
+
+async def _collection_info(point) -> CollectionInfo:
+    collection_id = str(point.id)
+    payload = point.payload or {}
+    members = qdrant_wrapper.collection_filter(collection_id)
+    image_count = await qdrant_wrapper.count(members)
+
+    cover = None
+    cover_id = payload.get("cover_image_id")
+    if cover_id:
+        try:
+            candidate = await qdrant_wrapper.get_point(cover_id)
+            if candidate and collection_id in gc.current_membership(candidate.payload or {}):
+                cover = candidate
+        except Exception:
+            pass  # a deleted cover falls back to the first image
+    if cover is None and image_count:
+        first, _ = await qdrant_wrapper.scroll(limit=1, scroll_filter=members)
+        cover = first[0] if first else None
+
+    return CollectionInfo(
+        id=collection_id,
+        title=payload.get("title", ""),
+        description=payload.get("description"),
+        threshold=_collection_threshold(payload),
+        image_count=image_count,
+        cover_image_id=cover_id,
+        cover_preview_url=(cover.payload or {}).get("preview_url") if cover else None,
+    )
+
+
+@app.get("/admin/collections", response_model=List[CollectionInfo])
+async def admin_list_collections(username: str = Depends(verify_credentials)):
+    """All collections, oldest first, with their image counts and covers."""
+    points = await qdrant_wrapper.list_gallery_collections()
+    points.sort(key=lambda p: (p.payload or {}).get("created_at", 0))
+    return list(await asyncio.gather(*(_collection_info(p) for p in points)))
+
+
+@app.post("/admin/collections", response_model=CollectionInfo)
+async def admin_create_collection(
+    req: CollectionCreateRequest, username: str = Depends(verify_credentials)
+):
+    """
+    Create a collection and put `image_ids` in it. The images come from the review step
+    (`/admin/collections/preview`), where the admin picked which matches to keep.
+    """
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
+    description = (req.description or "").strip() or None
+    image_ids = _clean_image_ids(req.image_ids)
+    if image_ids:
+        existing = await _fetch_images(image_ids)
+        missing = [i for i in image_ids if i not in existing]
+        if missing:
+            raise HTTPException(
+                status_code=400, detail=f"Unknown image(s): {', '.join(missing)}"
+            )
+
+    _, sparse_vec, text_dense_embedding = await _embed_metadata(
+        title, description, None, None
+    )
+    collection_id = str(uuid.uuid4())
+    await qdrant_wrapper.upsert_gallery_collection(
+        collection_id=collection_id,
+        text_dense_vector=text_dense_embedding,
+        sparse_vector=sparse_vec,
+        payload={
+            "title": title,
+            "description": description,
+            "threshold": (
+                settings.DEFAULT_COLLECTION_THRESHOLD
+                if req.threshold is None
+                else req.threshold
+            ),
+            "cover_image_id": None,
+            "created_at": time.time(),
+        },
+    )
+    if image_ids:
+        try:
+            await _change_membership(image_ids, [collection_id], [])
+        except Exception:
+            # Do not leave a half-filled collection behind; the admin can simply retry
+            try:
+                await qdrant_wrapper.delete_gallery_collection(collection_id)
+            except Exception as e:
+                print(f"Warning: could not roll back collection {collection_id}: {e}")
+            raise
+    return await _collection_info(await _require_collection(collection_id))
+
+
+@app.post("/admin/collections/preview", response_model=CollectionPreviewResponse)
+async def admin_preview_collection(
+    req: CollectionPreviewRequest, username: str = Depends(verify_credentials)
+):
+    """
+    Review step for a new (or extended) collection: embeds the draft title+description and
+    returns the existing images closest to it, best first, with their cosine scores.
+    Nothing is written. The UI filters by threshold locally and then sends the kept ids to
+    `POST /admin/collections`.
+    """
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
+    _, _, vector = await _embed_metadata(title, (req.description or "").strip() or None, None, None)
+    points = await qdrant_wrapper.search_images_by_text_vector(
+        vector, limit=req.limit, score_threshold=req.min_score
+    )
+    return CollectionPreviewResponse(
+        items=[
+            SearchResult(
+                id=str(p.id),
+                preview_url=(p.payload or {}).get("preview_url", ""),
+                original_url=(p.payload or {}).get("original_url", ""),
+                metadata=p.payload or {},
+                score=p.score,
+            )
+            for p in points
+        ],
+        default_threshold=settings.DEFAULT_COLLECTION_THRESHOLD,
+    )
+
+
+@app.post("/admin/collections/suggest", response_model=List[CollectionMatch])
+async def admin_suggest_collections(
+    req: SuggestRequest, username: str = Depends(verify_credentials)
+):
+    """
+    Which collections an image with this metadata would join, for the upload and edit forms.
+    Every collection comes back with its score and threshold (best first); `matched` marks the
+    ones to pre-select, the rest are near misses the admin may still want.
+    """
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
+    # Same text as is stored for the image, so the score equals what ingest would compute
+    _, _, vector = await _embed_metadata(
+        title,
+        (req.description or "").strip() or None,
+        (req.taken_time or "").strip() or None,
+        (req.camera or "").strip() or None,
+    )
+    return await _score_collections(vector)
+
+
+@app.get("/admin/collections/{collection_id}", response_model=CollectionInfo)
+async def admin_get_collection(
+    collection_id: str, username: str = Depends(verify_credentials)
+):
+    return await _collection_info(await _require_collection(collection_id))
+
+
+@app.patch("/admin/collections/{collection_id}", response_model=CollectionInfo)
+async def admin_update_collection(
+    collection_id: str,
+    req: CollectionUpdateRequest,
+    username: str = Depends(verify_credentials),
+):
+    """
+    Edit a collection. Changing its title or description re-embeds the anchor; the members
+    are left as they are (use the review step again to find more images).
+    """
+    point = await _require_collection(collection_id)
+    payload = point.payload or {}
+
+    updates = {}
+    if req.title is not None:
+        title = req.title.strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="Title cannot be empty")
+        updates["title"] = title
+    if req.description is not None:
+        updates["description"] = req.description.strip() or None
+    if req.threshold is not None:
+        updates["threshold"] = req.threshold
+    if req.cover_image_id is not None:
+        cover_id = req.cover_image_id.strip()
+        if cover_id:
+            cover_id = _clean_image_ids([cover_id])[0]
+            cover = (await _fetch_images([cover_id])).get(cover_id)
+            if cover is None or collection_id not in gc.current_membership(cover):
+                raise HTTPException(
+                    status_code=400, detail="Cover must be an image in this collection"
+                )
+        updates["cover_image_id"] = cover_id or None
+
+    changed = {k: v for k, v in updates.items() if payload.get(k) != v}
+    if changed:
+        vectors = {}
+        if "title" in changed or "description" in changed:
+            merged = {**payload, **changed}
+            _, sparse_vec, text_dense_embedding = await _embed_metadata(
+                merged.get("title", ""), merged.get("description"), None, None
+            )
+            vectors = {"text_dense_vector": text_dense_embedding, "sparse_vector": sparse_vec}
+        await qdrant_wrapper.update_gallery_collection(collection_id, changed, **vectors)
+    return await _collection_info(await _require_collection(collection_id))
+
+
+@app.delete("/admin/collections/{collection_id}")
+async def admin_delete_collection(
+    collection_id: str, username: str = Depends(verify_credentials)
+):
+    """
+    Delete a collection. Its images are not touched, they just leave the collection (and may
+    be matched into others again). The members are cleaned first, so a failure midway leaves
+    a collection that can simply be deleted again, never images pointing at a missing one.
+    """
+    await _require_collection(collection_id)
+    members = qdrant_wrapper.collection_filter(collection_id)
+    member_ids, offset = [], None
+    while True:
+        page, offset = await qdrant_wrapper.scroll(
+            limit=200, offset=offset, scroll_filter=members
+        )
+        member_ids.extend(str(p.id) for p in page)
+        if offset is None:
+            break
+    for i in range(0, len(member_ids), 200):
+        await _change_membership(
+            member_ids[i : i + 200], [], [collection_id], by_admin=False
+        )
+    await qdrant_wrapper.delete_gallery_collection(collection_id)
+    return {"status": "deleted", "id": collection_id, "removed_images": len(member_ids)}
+
+
+@app.get("/admin/collections/{collection_id}/images", response_model=AdminImageList)
+async def admin_collection_images(
+    collection_id: str,
+    limit: int = Query(40, ge=1, le=100),
+    cursor: Optional[str] = None,
+    username: str = Depends(verify_credentials),
+):
+    """Paginated images of one collection, shaped like `GET /admin/images`."""
+    await _require_collection(collection_id)
+    members = qdrant_wrapper.collection_filter(collection_id)
+    try:
+        points, next_cursor = await qdrant_wrapper.scroll(
+            limit=limit, offset=cursor, scroll_filter=members
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not list images: {e}")
+    return AdminImageList(
+        items=[_to_search_result(str(p.id), p.payload or {}) for p in points],
+        next_cursor=str(next_cursor) if next_cursor is not None else None,
+        total=await qdrant_wrapper.count(members),
+    )
+
+
+@app.post("/admin/images/membership", response_model=MembershipResponse)
+async def admin_change_membership(
+    req: MembershipRequest, username: str = Depends(verify_credentials)
+):
+    """
+    Add images to and/or remove them from collections in one go (multi-select in the
+    admin portal). Taking an image out of its last collection is remembered, so automatic
+    assignment does not put it back. Images that no longer exist come back in `missing`.
+    """
+    image_ids = _clean_image_ids(req.image_ids)
+    add, remove = gc.dedupe(req.add), gc.dedupe(req.remove)
+    if not image_ids or not (add or remove):
+        raise HTTPException(
+            status_code=400, detail="Provide image_ids and something to add or remove"
+        )
+    if set(add) & set(remove):
+        raise HTTPException(status_code=400, detail="Cannot add and remove the same collection")
+    await _require_collections(add)
+    return await _change_membership(image_ids, add, remove)
 
 
 @app.post("/search", response_model=List[SearchResult])

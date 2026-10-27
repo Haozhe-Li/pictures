@@ -147,10 +147,16 @@ Returns one entry per file; `PUT` the raw file to `upload_url` with the same `Co
 **Step 2: `POST /ingest/staged`** (JSON)
 
 ```json
-{ "key": "staging/<uuid>.jpg", "title": "...", "description": null, "taken_time": null, "camera": null }
+{ "key": "staging/<uuid>.jpg", "title": "...", "description": null, "taken_time": null, "camera": null,
+  "collection_ids": ["<collection uuid>"] }
 ```
 
-Runs the same pipeline as `/ingest` and returns the same response. Add an R2 lifecycle
+`collection_ids` is optional: a list puts the image in exactly those collections (`[]` = none, and
+that is remembered so it is never matched automatically later); leave it out to let the server match
+the new image against the collections (see 12). Unknown collection ids are rejected (400) before
+anything is downloaded or published.
+
+Runs the same pipeline as `/ingest` and returns the same response, plus the image's `collection_ids`. Add an R2 lifecycle
 rule expiring the `staging/` prefix (e.g. after 1 day) to clean up uploads that were never ingested.
 
 ## 5. Generate Random Query
@@ -323,9 +329,14 @@ Stable, paginated listing of every image (`/gallery` is a random feed and cannot
 ### 11.2 Update Metadata
 
 - **URL**: `PATCH /admin/images/{image_id}`
-- **Request Body (JSON)**: any of `title`, `description`, `taken_time`, `camera`.
+- **Request Body (JSON)**: any of `title`, `description`, `taken_time`, `camera`, `collection_ids`.
   Omitted or `null` fields are left unchanged; an empty string clears an optional field;
   `title` can never be empty (400).
+- **Collections**: `collection_ids` sets the image's collections to exactly that list (`[]` = none,
+  remembered as an opt-out, see 12). Unknown ids are a 400 and nothing is written. Left out, the
+  membership is kept, except that an image in **no** collection that has **not** opted out is matched
+  against the collections when its text changes, and joins those at or above their thresholds.
+  Membership is written in the same request as the text and vectors.
 - **Re-embedding**: the title, description, taken time and camera are all part of the indexed
   text, so any change recomputes the `sparse` and `dense-text` vectors (the `dense-image`
   vector is untouched). The vectors and payload are written in a single Qdrant request, and
@@ -360,3 +371,123 @@ original from R2).
 - **URL**: `POST /admin/images/{image_id}/describe`
 - **Response**: `{ "title": "...", "description": "..." }`
 - **Errors**: `404` unknown id or missing original.
+
+## 12. Admin: Collections
+
+All endpoints below **require Authentication (Basic Auth)**.
+
+A collection is a user-facing group of images (not a Qdrant collection). Its title and description are
+embedded like an image's text (`dense-text` MiniLM + `sparse` BM25) and stored as the collection's
+*anchor* in the Qdrant collection `gallery_collections`. Images carry their membership in the payload:
+
+- `collection_ids`: the collections the image is in. An image can be in several.
+- `collections_opt_out`: `true` once an admin deliberately left the image in none (removed it from its
+  last collection, or chose none on upload/edit), so automatic assignment never puts it back.
+
+**Automatic assignment** compares the image's stored `dense-text` vector with each anchor by cosine
+score (BM25 scores have no fixed scale, so only the dense score counts) and joins every collection whose
+score reaches its own `threshold` (default `COLLECTION_DEFAULT_THRESHOLD`, 0.5). It only ever applies to
+an image with no collection that has not opted out; an image that already has collections is never
+changed automatically. If matching fails the image simply lands in none. A new collection reaches the
+existing images through the review step (12.2), not silently.
+
+### 12.1 List / Get Collections
+
+- **URL**: `GET /admin/collections` (oldest first), `GET /admin/collections/{id}`
+- **Response Example** (a list for the first, a single object for the second):
+  ```json
+  [{
+    "id": "uuid-string",
+    "title": "Desert Road Trip",
+    "description": "Cacti, boneyards and long straight roads.",
+    "threshold": 0.5,
+    "image_count": 12,
+    "cover_image_id": null,
+    "cover_preview_url": "https://cdn.haozheli.com/uuid_preview.webp"
+  }]
+  ```
+  `cover_image_id` is the admin's explicit choice; while it is `null` (or that image has been deleted or
+  left the collection) the cover is the collection's first image.
+- **Errors**: `404` unknown id.
+
+### 12.2 Review Matches for a New Collection
+
+Embeds a draft title and description and returns the existing images closest to it. **Nothing is
+written.** The UI filters by threshold locally, lets the admin tick which to keep, then calls 12.3.
+
+- **URL**: `POST /admin/collections/preview`
+- **Request Body (JSON)**: `title` (required), `description`, `limit` (1-500, default 200),
+  `min_score` (cosine floor, default 0.2).
+- **Response Example**:
+  ```json
+  {
+    "items": [{ "id": "uuid", "preview_url": "...", "original_url": "...", "score": 0.83,
+                "metadata": { "title": "...", "collection_ids": ["other-uuid"], "collections_opt_out": false } }],
+    "default_threshold": 0.5
+  }
+  ```
+  Best match first. `metadata.collection_ids` shows which images are already in other collections.
+- **Errors**: `400` blank title.
+
+### 12.3 Create a Collection
+
+- **URL**: `POST /admin/collections`
+- **Request Body (JSON)**: `title` (required), `description`, `threshold` (0-1, default
+  `COLLECTION_DEFAULT_THRESHOLD`), `image_ids` (the images to put in it, at most 1000).
+- **Response**: the collection (see 12.1). If putting the images in fails, the new collection is rolled
+  back, so a retry starts clean.
+- **Errors**: `400` blank title, invalid or unknown image id; `422` threshold out of range.
+
+### 12.4 Update a Collection
+
+- **URL**: `PATCH /admin/collections/{id}`
+- **Request Body (JSON)**: any of `title`, `description` (empty clears), `threshold`, `cover_image_id`
+  (empty clears; must be an image in the collection).
+- Changing the title or description re-embeds the anchor. **Members are left as they are**; run 12.2 again
+  to find more images. A new threshold only affects future matching.
+- **Response**: the collection. **Errors**: `404` unknown id, `400` blank title / bad cover.
+
+### 12.5 Delete a Collection
+
+- **URL**: `DELETE /admin/collections/{id}`
+- **Response Example**: `{ "status": "deleted", "id": "uuid", "removed_images": 12 }`
+- The images are untouched and stay in the library; they just leave the collection (this does **not**
+  count as an opt-out, so they may be matched into others later). Members are cleaned before the
+  collection is removed, so a failure midway leaves a collection that can be deleted again.
+  Deleting an *image* needs no collection cleanup.
+- **Errors**: `404` unknown id.
+
+### 12.6 List a Collection's Images
+
+- **URL**: `GET /admin/collections/{id}/images?limit=40&cursor=...`
+- **Response**: same shape as `GET /admin/images` (`items`, `next_cursor`, `total`).
+- **Errors**: `404` unknown id.
+
+### 12.7 Add / Remove Images (multi-select)
+
+- **URL**: `POST /admin/images/membership`
+- **Request Body (JSON)**: `image_ids` (at most 1000), `add` and `remove` (collection ids; at least one
+  non-empty, and no id in both).
+- **Response Example**:
+  ```json
+  { "updated": [{ "id": "uuid", "collection_ids": ["a"], "collections_opt_out": false }],
+    "missing": ["uuid-of-an-image-that-no-longer-exists"] }
+  ```
+  Taking an image out of its last collection sets `collections_opt_out`; adding it to one clears it.
+  Removing a collection id that no longer exists is allowed (cleans dangling ids).
+- **Errors**: `400` invalid image id, unknown collection in `add`, add/remove overlap, nothing to do.
+
+### 12.8 Suggest Collections for an Image
+
+For the upload and edit forms: which collections an image with this metadata would join.
+
+- **URL**: `POST /admin/collections/suggest`
+- **Request Body (JSON)**: `title` (required), `description`, `taken_time`, `camera`. Embedded the same way
+  as at ingest, so the score equals what ingest would compute.
+- **Response Example**:
+  ```json
+  [{ "id": "uuid", "title": "Desert Road Trip", "score": 0.72, "threshold": 0.5, "matched": true },
+   { "id": "uuid", "title": "Winter", "score": 0.08, "threshold": 0.5, "matched": false }]
+  ```
+  Every collection, best first. Pre-select the `matched` ones; the rest are near misses.
+- **Errors**: `400` blank title.

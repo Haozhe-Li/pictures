@@ -67,6 +67,35 @@ class QdrantClientWrapper:
         except Exception as e:
             print(f"Warning: could not ensure payload index on original_url: {e}")
 
+        # Collection membership lives on the image points; listing a collection's images
+        # filters on it.
+        try:
+            await self.client.create_payload_index(
+                collection_name=settings.COLLECTION_NAME,
+                field_name="collection_ids",
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
+        except Exception as e:
+            print(f"Warning: could not ensure payload index on collection_ids: {e}")
+
+        await self._init_gallery_collections()
+
+    async def _init_gallery_collections(self):
+        """Create the store for collection anchors (text vectors only) if it is missing."""
+        collections = await self.client.get_collections()
+        if any(c.name == settings.GALLERY_COLLECTIONS_NAME for c in collections.collections):
+            return
+        await self.client.create_collection(
+            collection_name=settings.GALLERY_COLLECTIONS_NAME,
+            vectors_config={
+                "dense-text": VectorParams(size=settings.TEXT_DIM, distance=Distance.COSINE)
+            },
+            sparse_vectors_config={
+                "sparse": SparseVectorParams(index=models.SparseIndexParams(on_disk=False))
+            },
+        )
+        print(f"Collection {settings.GALLERY_COLLECTIONS_NAME} created.")
+
     async def upsert_point(
         self,
         point_id: str,
@@ -148,12 +177,18 @@ class QdrantClientWrapper:
         )
         return search_result.points
 
-    async def scroll(self, limit: int = 20, offset: str = None):
+    async def scroll(
+        self,
+        limit: int = 20,
+        offset: str = None,
+        scroll_filter: Optional[models.Filter] = None,
+    ):
         """
-        Scroll through points in the collection (pagination).
+        Scroll through points in the collection (pagination), optionally filtered.
         """
         points, next_offset = await self.client.scroll(
             collection_name=settings.COLLECTION_NAME,
+            scroll_filter=scroll_filter,
             limit=limit,
             offset=offset,
             with_payload=True,
@@ -161,10 +196,12 @@ class QdrantClientWrapper:
         )
         return points, next_offset
 
-    async def count(self) -> int:
-        """Total number of points in the collection."""
+    async def count(self, count_filter: Optional[models.Filter] = None) -> int:
+        """Number of points in the collection (matching `count_filter`, if given)."""
         result = await self.client.count(
-            collection_name=settings.COLLECTION_NAME, exact=True
+            collection_name=settings.COLLECTION_NAME,
+            count_filter=count_filter,
+            exact=True,
         )
         return result.count
 
@@ -209,6 +246,153 @@ class QdrantClientWrapper:
         await self.client.delete(
             collection_name=settings.COLLECTION_NAME,
             points_selector=models.PointIdsList(points=[point_id]),
+        )
+
+    # --- Collections (user-facing albums) ---
+
+    @staticmethod
+    def collection_filter(collection_id: str) -> models.Filter:
+        """Matches the images that belong to `collection_id`."""
+        return models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="collection_ids", match=models.MatchValue(value=collection_id)
+                )
+            ]
+        )
+
+    async def set_membership(self, memberships: Dict[str, Dict[str, Any]]):
+        """
+        Write `collection_ids` / `collections_opt_out` onto image points. `memberships`
+        maps point id -> the payload keys to set. Sent in batches, one operation per point.
+        """
+        items = list(memberships.items())
+        for i in range(0, len(items), 200):
+            await self.client.batch_update_points(
+                collection_name=settings.COLLECTION_NAME,
+                update_operations=[
+                    models.SetPayloadOperation(
+                        set_payload=models.SetPayload(payload=payload, points=[point_id])
+                    )
+                    for point_id, payload in items[i : i + 200]
+                ],
+            )
+
+    async def search_images_by_text_vector(
+        self, text_vector: List[float], limit: int, score_threshold: Optional[float] = None
+    ):
+        """Images ranked by cosine similarity of their `dense-text` vector to `text_vector`."""
+        res = await self.client.query_points(
+            collection_name=settings.COLLECTION_NAME,
+            query=text_vector,
+            using="dense-text",
+            limit=limit,
+            score_threshold=score_threshold,
+            with_payload=True,
+        )
+        return res.points
+
+    async def upsert_gallery_collection(
+        self,
+        collection_id: str,
+        text_dense_vector: List[float],
+        sparse_vector: Dict[str, Any],
+        payload: Dict[str, Any],
+    ):
+        await self.client.upsert(
+            collection_name=settings.GALLERY_COLLECTIONS_NAME,
+            points=[
+                models.PointStruct(
+                    id=collection_id,
+                    vector={
+                        "dense-text": text_dense_vector,
+                        "sparse": models.SparseVector(
+                            indices=sparse_vector["indices"],
+                            values=sparse_vector["values"],
+                        ),
+                    },
+                    payload=payload,
+                )
+            ],
+        )
+
+    async def update_gallery_collection(
+        self,
+        collection_id: str,
+        payload: Dict[str, Any],
+        text_dense_vector: Optional[List[float]] = None,
+        sparse_vector: Optional[Dict[str, Any]] = None,
+    ):
+        """Merge `payload`; replace the anchor vectors too when they are given."""
+        operations: List[Any] = []
+        if text_dense_vector is not None and sparse_vector is not None:
+            operations.append(
+                models.UpdateVectorsOperation(
+                    update_vectors=models.UpdateVectors(
+                        points=[
+                            models.PointVectors(
+                                id=collection_id,
+                                vector={
+                                    "dense-text": text_dense_vector,
+                                    "sparse": models.SparseVector(
+                                        indices=sparse_vector["indices"],
+                                        values=sparse_vector["values"],
+                                    ),
+                                },
+                            )
+                        ]
+                    )
+                )
+            )
+        operations.append(
+            models.SetPayloadOperation(
+                set_payload=models.SetPayload(payload=payload, points=[collection_id])
+            )
+        )
+        await self.client.batch_update_points(
+            collection_name=settings.GALLERY_COLLECTIONS_NAME,
+            update_operations=operations,
+        )
+
+    async def get_gallery_collection(self, collection_id: str):
+        points = await self.client.retrieve(
+            collection_name=settings.GALLERY_COLLECTIONS_NAME,
+            ids=[collection_id],
+            with_payload=True,
+            with_vectors=False,
+        )
+        return points[0] if points else None
+
+    async def list_gallery_collections(self):
+        """Every collection (there are only ever a handful)."""
+        points, offset = [], None
+        while True:
+            page, offset = await self.client.scroll(
+                collection_name=settings.GALLERY_COLLECTIONS_NAME,
+                limit=200,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            points.extend(page)
+            if offset is None:
+                return points
+
+    async def score_gallery_collections(self, text_vector: List[float]):
+        """Every collection with its cosine score against `text_vector`, best first."""
+        res = await self.client.query_points(
+            collection_name=settings.GALLERY_COLLECTIONS_NAME,
+            query=text_vector,
+            using="dense-text",
+            limit=200,
+            with_payload=True,
+        )
+        return res.points
+
+    async def delete_gallery_collection(self, collection_id: str):
+        await self.client.delete(
+            collection_name=settings.GALLERY_COLLECTIONS_NAME,
+            points_selector=models.PointIdsList(points=[collection_id]),
         )
 
     async def find_point_by_image_url(self, image_url: str):
