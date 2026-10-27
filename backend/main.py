@@ -14,6 +14,7 @@ from fastapi import (
     Form,
     HTTPException,
     Depends,
+    Query,
     status,
 )
 from botocore.exceptions import ClientError
@@ -35,6 +36,7 @@ from core.storage import (
     delete_object,
     download_object,
     get_object_size,
+    key_from_public_url,
     presign_staging_put,
     upload_file_to_r2,
 )
@@ -214,6 +216,37 @@ class GenerateDescriptionResponse(BaseModel):
 # --- Endpoints ---
 
 
+async def _embed_metadata(
+    title: str,
+    description: Optional[str],
+    taken_time: Optional[str],
+    camera: Optional[str],
+):
+    """
+    Builds the metadata text and embeds it for the two text indexes (`sparse` BM25 and
+    `dense-text`). Shared by ingest and metadata edits so both always index the same text.
+    Returns (metadata_text, sparse_vector, text_dense_vector).
+    """
+    metadata_text = f"{title} {description or ''} {taken_time or ''} {camera or ''}"
+
+    # FastEmbed is CPU bound, might want to offload if heavy, but for short text it's fast.
+    sparse_vec = await run_in_threadpool(get_sparse_embedding, metadata_text)
+
+    try:
+        text_dense_embedding = await run_in_threadpool(
+            embedding_client.get_embedding,
+            text=metadata_text,
+            model=settings.TEXT_MODEL,
+        )
+    except Exception as e:
+        print(f"Warning: Metadata Dense Embedding failed: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Metadata Embedding failed: {str(e)}"
+        )
+
+    return metadata_text, sparse_vec, text_dense_embedding
+
+
 async def _ingest_bytes(
     file_bytes: bytes,
     title: str,
@@ -286,28 +319,10 @@ async def _ingest_bytes(
 
         print(f"Uploaded to R2. Preview: {r2_url_preview}, Original: {r2_url_original}")
 
-        # 4. Sparse Embedding
-        # Combine relevant metadata text for sparse search
-        metadata_text = f"{title} {description or ''} {taken_time or ''} {camera or ''}"
-
-        # FastEmbed is CPU bound, might want to offload if heavy, but for short text it's fast.
-        sparse_vec = await run_in_threadpool(get_sparse_embedding, metadata_text)
-
-        # 4.5 Dense Embedding (Metadata Text)
-        try:
-            text_dense_embedding = await run_in_threadpool(
-                embedding_client.get_embedding,
-                text=metadata_text,
-                model=settings.TEXT_MODEL,
-            )
-        except Exception as e:
-            print(f"Warning: Metadata Dense Embedding failed: {e}")
-            # Fallback? Or just fail? Let's use zero vector or fail.
-            # Ideally fail, but maybe we can just duplicate image embedding if we had to.
-            # But let's fail to ensure quality.
-            raise HTTPException(
-                status_code=500, detail=f"Metadata Embedding failed: {str(e)}"
-            )
+        # 4. Sparse + dense embedding of the metadata text
+        metadata_text, sparse_vec, text_dense_embedding = await _embed_metadata(
+            title, description, taken_time, camera
+        )
 
         # 5. Qdrant Upsert
         point_id = str(file_uuid)
@@ -471,15 +486,9 @@ async def ingest_staged_image(
     return result
 
 
-@app.post("/generate-description", response_model=GenerateDescriptionResponse)
-async def generate_description_endpoint(
-    file: UploadFile = File(...), username: str = Depends(verify_credentials)
-):
-    """
-    Generate title and description for an image using LLM.
-    """
+async def _describe_bytes(file_bytes: bytes) -> GenerateDescriptionResponse:
+    """Runs the LLM captioner on raw image bytes (downscaled first)."""
     try:
-        file_bytes = await file.read()
         if not file_bytes:
             raise HTTPException(status_code=400, detail="Empty file")
 
@@ -499,6 +508,199 @@ async def generate_description_endpoint(
         raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generate-description", response_model=GenerateDescriptionResponse)
+async def generate_description_endpoint(
+    file: UploadFile = File(...), username: str = Depends(verify_credentials)
+):
+    """
+    Generate title and description for an image using LLM.
+    """
+    return await _describe_bytes(await file.read())
+
+
+# --- Admin: manage published images ---
+
+
+class AdminImageList(BaseModel):
+    items: List[SearchResult]
+    next_cursor: Optional[str] = None
+    total: int
+
+
+class ImageUpdateRequest(BaseModel):
+    """
+    Partial update: omitted/null fields are left alone, an empty string clears an
+    optional field. `title` can be changed but never blanked.
+    """
+
+    title: Optional[str] = None
+    description: Optional[str] = None
+    taken_time: Optional[str] = None
+    camera: Optional[str] = None
+
+
+EDITABLE_FIELDS = ("title", "description", "taken_time", "camera")
+
+
+def _to_search_result(point_id: str, payload: dict) -> SearchResult:
+    return SearchResult(
+        id=point_id,
+        preview_url=payload.get("preview_url", ""),
+        original_url=payload.get("original_url", ""),
+        metadata=payload,
+        score=1.0,
+    )
+
+
+async def _require_point(image_id: str):
+    try:
+        point = await qdrant_wrapper.get_point(image_id)
+    except Exception:
+        # Qdrant rejects ids that are neither integers nor UUIDs
+        raise HTTPException(status_code=404, detail="Image not found")
+    if not point:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return point
+
+
+@app.get("/admin/images", response_model=AdminImageList)
+async def admin_list_images(
+    limit: int = Query(40, ge=1, le=100),
+    cursor: Optional[str] = None,
+    username: str = Depends(verify_credentials),
+):
+    """
+    Stable, paginated listing of every image (unlike /gallery, which is a random feed).
+    Pass the returned `next_cursor` to fetch the following page.
+    """
+    try:
+        points, next_cursor = await qdrant_wrapper.scroll(limit=limit, offset=cursor)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not list images: {e}")
+
+    total = await qdrant_wrapper.count()
+    return AdminImageList(
+        items=[_to_search_result(str(p.id), p.payload or {}) for p in points],
+        next_cursor=str(next_cursor) if next_cursor is not None else None,
+        total=total,
+    )
+
+
+@app.patch("/admin/images/{image_id}", response_model=SearchResult)
+async def admin_update_image(
+    image_id: str,
+    req: ImageUpdateRequest,
+    username: str = Depends(verify_credentials),
+):
+    """
+    Edit an image's metadata and re-embed it. The title, description, time and camera
+    are all part of the text that gets indexed, so any change re-computes the sparse and
+    `dense-text` vectors; the image vector is untouched.
+    """
+    point = await _require_point(image_id)
+    payload = point.payload or {}
+
+    updates = {}
+    for field in EDITABLE_FIELDS:
+        value = getattr(req, field)
+        if value is None:
+            continue
+        value = value.strip()
+        if field == "title":
+            if not value:
+                raise HTTPException(status_code=400, detail="Title cannot be empty")
+            updates[field] = value
+        else:
+            updates[field] = value or None
+
+    changed = {k: v for k, v in updates.items() if payload.get(k) != v}
+    if not changed:
+        return _to_search_result(image_id, payload)
+
+    merged = {**payload, **changed}
+    # Embed first: if the embedding service fails nothing has been written yet.
+    _, sparse_vec, text_dense_embedding = await _embed_metadata(
+        merged.get("title", ""),
+        merged.get("description"),
+        merged.get("taken_time"),
+        merged.get("camera"),
+    )
+    await qdrant_wrapper.update_metadata(
+        point_id=image_id,
+        text_dense_vector=text_dense_embedding,
+        sparse_vector=sparse_vec,
+        payload=changed,
+    )
+    return _to_search_result(image_id, merged)
+
+
+@app.delete("/admin/images/{image_id}")
+async def admin_delete_image(
+    image_id: str, username: str = Depends(verify_credentials)
+):
+    """
+    Delete an image everywhere: the Qdrant point, its Redis pool/counter entries and the
+    preview + original files in R2. Order matters: the point goes first so the gallery
+    stops serving it immediately; a failure afterwards leaves only orphaned files or
+    stale Redis entries (the gallery skips ids Qdrant no longer has), never a record
+    pointing at missing files. Those leftovers are reported in `warnings`.
+    """
+    point = await _require_point(image_id)
+    payload = point.payload or {}
+
+    warnings: List[str] = []
+    keys = []
+    for field in ("preview_url", "original_url"):
+        key = key_from_public_url(payload.get(field))
+        if key:
+            keys.append(key)
+        elif payload.get(field):
+            warnings.append(f"Not deleting {field}: unrecognised file {payload[field]}")
+
+    await qdrant_wrapper.delete_point(image_id)
+
+    try:
+        pipe = redis_client.pipeline(transaction=False)
+        pipe.zrem("gallery:pool:active", image_id)
+        pipe.zrem("gallery:pool:explore", image_id)
+        pipe.hdel("gallery:counters:click", image_id)
+        pipe.hdel("gallery:counters:share", image_id)
+        await pipe.execute()
+    except Exception as e:
+        print(f"Warning: failed to clean Redis entries for {image_id}: {e}")
+        warnings.append(f"Redis cleanup failed: {e}")
+
+    for key in keys:
+        try:
+            await run_in_threadpool(delete_object, key)
+        except Exception as e:
+            print(f"Warning: failed to delete {key} from R2: {e}")
+            warnings.append(f"Storage delete failed for {key}: {e}")
+
+    return {"status": "deleted", "id": image_id, "warnings": warnings}
+
+
+@app.post(
+    "/admin/images/{image_id}/describe", response_model=GenerateDescriptionResponse
+)
+async def admin_describe_image(
+    image_id: str, username: str = Depends(verify_credentials)
+):
+    """
+    Suggest a title and description for an already published image, read from the stored
+    original (the preview is too heavily compressed to caption well).
+    """
+    point = await _require_point(image_id)
+    key = key_from_public_url((point.payload or {}).get("original_url"))
+    if not key:
+        raise HTTPException(status_code=404, detail="Original file not found")
+    try:
+        file_bytes = await run_in_threadpool(download_object, key)
+    except ClientError:
+        raise HTTPException(status_code=404, detail="Original file not found")
+    return await _describe_bytes(file_bytes)
 
 
 @app.post("/search", response_model=List[SearchResult])
