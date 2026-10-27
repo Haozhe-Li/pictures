@@ -247,3 +247,5 @@ next-env.d.ts
 
 # all ds store
 .DS_Store
+# Autocomplete model, built on the deployed server (see backend/core/autocomplete.py)
+backend/data/

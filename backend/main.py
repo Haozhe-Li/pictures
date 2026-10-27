@@ -61,11 +61,10 @@ random_query_manager = RandomQueryManager(redis_client, qdrant_wrapper, embeddin
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load autocomplete model if available
-    autocomplete_manager.initialize()
-
     # Startup: Initialize Qdrant Collection
     await qdrant_wrapper.init_collection()
+    # Load the saved autocomplete model (if any) and refresh it from Qdrant in the background
+    autocomplete_manager.start(qdrant_wrapper)
     decay_task = asyncio.create_task(_decay_loop())
     # Fill the random-query queue in the background so the first click is already served from it
     await random_query_manager.warm_up()
@@ -75,6 +74,7 @@ async def lifespan(app: FastAPI):
         await decay_task
     except asyncio.CancelledError:
         pass
+    await autocomplete_manager.close()
     await random_query_manager.close()
     await redis_client.close()
     await qdrant_wrapper.client.close()
@@ -126,15 +126,6 @@ async def get_image_by_id(image_id: str):
             raise e
         print(f"Error fetching image {image_id}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
-
-
-@app.post("/autocomplete/build")
-async def build_autocomplete():
-    """
-    Trigger a rebuild of the autocomplete index from Qdrant data.
-    """
-    await autocomplete_manager.build_index(qdrant_wrapper)
-    return {"status": "success", "message": "Autocomplete index rebuilt."}
 
 
 # --- Security ---
@@ -347,6 +338,9 @@ async def _ingest_bytes(
         # 6. Add to Redis Pools for Waterfall Recommendation
         await redis_client.zadd("gallery:pool:active", {point_id: 0})
         await redis_client.zadd("gallery:pool:explore", {point_id: 0})
+
+        # 7. New title/description text: refresh the autocomplete index after a quiet period
+        autocomplete_manager.schedule_rebuild()
 
         return {
             "status": "success",
@@ -566,6 +560,29 @@ async def _require_point(image_id: str):
     return point
 
 
+@app.get("/admin/autocomplete/status")
+async def admin_autocomplete_status(username: str = Depends(verify_credentials)):
+    """
+    State of the autocomplete index: whether a rebuild is running or scheduled (and in how
+    many seconds), and when it was last built.
+    """
+    return autocomplete_manager.status()
+
+
+@app.post("/autocomplete/build")
+async def build_autocomplete(username: str = Depends(verify_credentials)):
+    """
+    Rebuild the autocomplete index from Qdrant right now, dropping any scheduled rebuild.
+    Returns once the new index is live. Normally unnecessary: ingest, edits and deletes
+    schedule a rebuild by themselves.
+    """
+    try:
+        await autocomplete_manager.rebuild_now()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Autocomplete rebuild failed: {e}")
+    return {"status": "success", "message": "Autocomplete index rebuilt."}
+
+
 @app.get("/admin/images", response_model=AdminImageList)
 async def admin_list_images(
     limit: int = Query(40, ge=1, le=100),
@@ -634,6 +651,9 @@ async def admin_update_image(
         sparse_vector=sparse_vec,
         payload=changed,
     )
+    # Autocomplete is built from titles and descriptions only
+    if "title" in changed or "description" in changed:
+        autocomplete_manager.schedule_rebuild()
     return _to_search_result(image_id, merged)
 
 
@@ -661,6 +681,7 @@ async def admin_delete_image(
             warnings.append(f"Not deleting {field}: unrecognised file {payload[field]}")
 
     await qdrant_wrapper.delete_point(image_id)
+    autocomplete_manager.schedule_rebuild()
 
     try:
         pipe = redis_client.pipeline(transaction=False)

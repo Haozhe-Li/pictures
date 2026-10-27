@@ -203,7 +203,7 @@ Generate a short title and detailed description for an uploaded image.
 
 Get search suggestions based on the current input prefix. Supports fuzzy matching and phrase completion.
 
-- **URL**: `GET /api/autocomplete`
+- **URL**: `GET /autocomplete`
 - **Query Parameters**:
   - `q` (string, required): The prefix or partial query to autocomplete.
 - **Response Example**:
@@ -217,9 +217,26 @@ Get search suggestions based on the current input prefix. Supports fuzzy matchin
   }
   ```
 
-## 9. Build Autocomplete Index
+The suggestions come from an in-memory trie built from every image's title and description.
+It is not stored in the repository:
 
-Trigger a rebuild of the autocomplete Trie index from the Qdrant database. This scans all image titles and descriptions and updates the in-memory and on-disk model.
+- On startup the backend loads the model saved on its own disk (`data/trie_model.pkl`, or
+  `AUTOCOMPLETE_MODEL_PATH`) if there is one, and always rebuilds from Qdrant in the background.
+  Until the first build finishes, suggestions are empty.
+- Ingesting an image, deleting one, or changing a title/description schedules a rebuild. It runs
+  after 5 minutes without further changes (each new change restarts the wait), and at the latest
+  30 minutes after the first pending change. A failed rebuild is retried the same way.
+- A rebuild builds a new trie off the request path and swaps it in when finished, so queries
+  always see a complete index. State is per process: with several backend instances, each one
+  only rebuilds for changes it handled itself.
+
+## 9. Rebuild Autocomplete Index
+
+**Requires Authentication (Basic Auth).**
+
+Rebuild the index from Qdrant right now, discarding any scheduled rebuild, and save it to disk.
+Returns once the new index is live. If a rebuild is already running, it is waited for and one more
+is run afterwards.
 
 - **URL**: `POST /autocomplete/build`
 - **Response Example**:
@@ -229,6 +246,25 @@ Trigger a rebuild of the autocomplete Trie index from the Qdrant database. This 
     "message": "Autocomplete index rebuilt."
   }
   ```
+- **Errors**: `500` if the rebuild fails (the previous index keeps serving).
+
+### 9.1 Autocomplete Status
+
+**Requires Authentication (Basic Auth).**
+
+- **URL**: `GET /admin/autocomplete/status`
+- **Response Example**:
+  ```json
+  {
+    "ready": true,
+    "building": false,
+    "pending": true,
+    "seconds_until_rebuild": 241.3,
+    "last_built_at": 1761580000.0
+  }
+  ```
+  `pending` means a rebuild is scheduled, `seconds_until_rebuild` is the time left until it starts
+  (`null` when nothing is pending), `last_built_at` is epoch seconds (`null` before the first build).
 
 ## 10. Get Image by ID
 

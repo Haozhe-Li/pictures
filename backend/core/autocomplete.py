@@ -2,12 +2,23 @@ import os
 import re
 import string
 import asyncio
-from typing import List
+import time
+from typing import Dict, List, Optional, Set, Tuple
 from core.trie import Trie
 from core.config import settings
 
-# Define the path for the serialized model
-TRIE_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "trie_model.pkl")
+# The serialized model lives on the deployment's disk, not in the repo: it is rebuilt from
+# Qdrant on every start and whenever images change (see AutocompleteManager).
+TRIE_MODEL_PATH = os.getenv("AUTOCOMPLETE_MODEL_PATH") or os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "data", "trie_model.pkl"
+)
+
+# After a change, wait this long without further changes before rebuilding, so a batch of
+# uploads or edits costs one rebuild. Every new change restarts the wait...
+REBUILD_QUIET_SECONDS = 5 * 60
+# ...but never postpone the rebuild past this long after the first unbuilt change, so a
+# steady trickle of edits cannot starve it.
+REBUILD_MAX_WAIT_SECONDS = 30 * 60
 
 # Define a minimal set of stop words for autocomplete logic
 STOP_WORDS = {
@@ -77,98 +88,183 @@ class SimplePhraseDetector:
         return phrases
 
 class AutocompleteManager:
+    """
+    Serves suggestions from an in-memory Trie that is rebuilt from Qdrant.
+
+    - `start()` loads the model from disk (so warm restarts answer immediately) and always
+      kicks off a fresh rebuild in the background.
+    - `schedule_rebuild()` marks the index stale; the rebuild runs after a quiet period.
+    - `rebuild_now()` cancels the wait and rebuilds immediately.
+
+    A rebuild builds a brand-new Trie off the event loop and swaps it in at the end, so
+    queries always see a complete index. State is per process (one backend instance).
+    """
+
     def __init__(self):
         self.trie = Trie()
         self.is_ready = False
         self.model_path = TRIE_MODEL_PATH
-        self.learned_phrases = set() # Store verified bigrams
+        self.learned_phrases: Set[str] = set()  # Verified bigrams of the current Trie
+        self.quiet_seconds = REBUILD_QUIET_SECONDS
+        self.max_wait_seconds = REBUILD_MAX_WAIT_SECONDS
+        self.is_building = False
+        self.last_built_at: Optional[float] = None  # epoch seconds
+        self._qdrant = None
+        self._build_lock = asyncio.Lock()
+        self._wait_task: Optional[asyncio.Task] = None
+        self._startup_task: Optional[asyncio.Task] = None
+        # Monotonic times of the first/latest change since the last rebuild began; None = nothing pending.
+        self._first_change_at: Optional[float] = None
+        self._last_change_at: Optional[float] = None
+
+    # --- Lifecycle ---
 
     def initialize(self):
-        """Attempts to load the model from disk on startup."""
-        if os.path.exists(self.model_path):
-            print(f"Loading autocomplete model from {self.model_path}...")
-            try:
-                self.trie = Trie.load(self.model_path)
-                self.is_ready = True
-                print("Autocomplete model loaded successfully.")
-            except Exception as e:
-                print(f"Failed to load autocomplete model: {e}. Starting with empty Trie.")
-        else:
-            print("No autocomplete model found. Please trigger build via /api/autocomplete/build.")
+        """Loads the model saved by a previous run, if there is one."""
+        if not os.path.exists(self.model_path):
+            print("No saved autocomplete model; it will be built from Qdrant.")
+            return
+        print(f"Loading autocomplete model from {self.model_path}...")
+        try:
+            self.trie = Trie.load(self.model_path)
+            self.is_ready = True
+            print("Autocomplete model loaded successfully.")
+        except Exception as e:
+            print(f"Failed to load autocomplete model: {e}. It will be rebuilt from Qdrant.")
 
-    async def build_index(self, qdrant_wrapper):
-        """Fetches data from Qdrant and rebuilds the Trie."""
-        print("Rebuilding autocomplete index from Qdrant...")
-        self.trie = Trie() # Reset
-        self.learned_phrases = set() # Reset
-        
-        offset = None
-        count = 0
-        total_points = 0
-        
-        print(f"Using collection: {settings.COLLECTION_NAME}")
+    def start(self, qdrant_wrapper):
+        """Call once Qdrant is reachable: load the saved model, then refresh it in the background."""
+        self._qdrant = qdrant_wrapper
+        self.initialize()
+        self._startup_task = asyncio.create_task(self._rebuild_quietly())
 
-        # Phase 1: Collect all text to learn phrases
-        all_texts = [] 
-        
-        # We need to scroll through everything first anyway.
-        # Ideally we loop once to collect text, train, then insert.
-        # Note: If dataset is massive (millions), saving all_texts in RAM is bad.
-        # But for typical gallery ( < 100k), 100k strings is fine (~20MB).
-        
+    async def close(self):
+        for task in (self._wait_task, self._startup_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    # --- Rebuild scheduling ---
+
+    def schedule_rebuild(self):
+        """Marks the index stale. Safe to call from any request handler; never blocks."""
+        now = time.monotonic()
+        if self._first_change_at is None:
+            self._first_change_at = now
+        self._last_change_at = now
+        if self._wait_task is None or self._wait_task.done():
+            self._wait_task = asyncio.create_task(self._wait_then_rebuild())
+
+    def _seconds_until_rebuild(self) -> Optional[float]:
+        if self._first_change_at is None or self._last_change_at is None:
+            return None
+        due = min(
+            self._last_change_at + self.quiet_seconds,
+            self._first_change_at + self.max_wait_seconds,
+        )
+        return max(0.0, due - time.monotonic())
+
+    async def _wait_then_rebuild(self):
+        # Moving `_last_change_at` is what "refreshes the timer": each pass recomputes the
+        # deadline, so there is nothing to cancel and restart. Changes that arrive during a
+        # rebuild set the timestamps again and are picked up by the next pass.
         while True:
-            records, next_offset = await qdrant_wrapper.client.scroll(
+            remaining = self._seconds_until_rebuild()
+            if remaining is None:
+                return
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                continue
+            self._first_change_at = self._last_change_at = None
+            await self._rebuild_quietly()
+
+    async def rebuild_now(self):
+        """
+        Drops the pending wait and rebuilds immediately, returning once the new index is live.
+        If a rebuild is already running, waits for it and then runs another one, because it
+        may have read the data before the change that prompted this call. Raises on failure.
+        """
+        self._first_change_at = self._last_change_at = None
+        if self._wait_task and not self._wait_task.done() and not self.is_building:
+            self._wait_task.cancel()
+        await self._rebuild()
+
+    def status(self) -> Dict:
+        return {
+            "ready": self.is_ready,
+            "building": self.is_building,
+            "pending": self._first_change_at is not None,
+            "seconds_until_rebuild": self._seconds_until_rebuild(),
+            "last_built_at": self.last_built_at,
+        }
+
+    # --- Rebuild ---
+
+    async def _rebuild_quietly(self):
+        """
+        Background rebuild. A failure is logged and the current index keeps serving; the
+        rebuild is scheduled again so a transient outage (e.g. Qdrant) heals by itself.
+        """
+        try:
+            await self._rebuild()
+        except Exception as e:
+            print(f"Autocomplete rebuild failed, will retry: {e}")
+            self.schedule_rebuild()
+
+    async def _rebuild(self):
+        async with self._build_lock:
+            self.is_building = True
+            try:
+                print("Rebuilding autocomplete index from Qdrant...")
+                texts = await self._fetch_texts()
+                trie, phrases = await asyncio.to_thread(self._build_trie, texts)
+                # Swap in the finished index in one step.
+                self.trie, self.learned_phrases = trie, phrases
+                self.is_ready = True
+                self.last_built_at = time.time()
+                print(f"Autocomplete index rebuilt from {len(texts)} text segments.")
+                try:
+                    await asyncio.to_thread(trie.save, self.model_path)
+                except Exception as e:
+                    print(f"Failed to save autocomplete model to {self.model_path}: {e}")
+            finally:
+                self.is_building = False
+
+    async def _fetch_texts(self) -> List[str]:
+        """Every title and description in the collection."""
+        texts: List[str] = []
+        offset = None
+        while True:
+            records, offset = await self._qdrant.client.scroll(
                 collection_name=settings.COLLECTION_NAME,
                 limit=100,
                 with_payload=True,
                 with_vectors=False,
-                offset=offset
+                offset=offset,
             )
-            
-            if not records:
-                break
-                
             for point in records:
-                payload = point.payload
-                if not payload: continue
-
+                payload = point.payload or {}
                 if payload.get("title"):
-                    all_texts.append(payload["title"])
-                
+                    texts.append(payload["title"])
                 if payload.get("description"):
-                    all_texts.append(payload["description"])
-            
-            count += len(records)
-            offset = next_offset
-            if offset is None:
-                break
-        
-        print(f"Collected {len(all_texts)} text segments. Learning phrases...")
-        
-        # Train Bigram Detector
+                    texts.append(payload["description"])
+            if not records or offset is None:
+                return texts
+
+    def _build_trie(self, texts: List[str]) -> Tuple[Trie, Set[str]]:
+        """CPU-bound: learns common phrases, then inserts every text. Run off the event loop."""
+        # Pre-tokenize exactly as insertion will, so the learned bigrams match.
         detector = SimplePhraseDetector(stop_words=STOP_WORDS)
-        # We need to pre-tokenize exactly as we do during insertion
-        # We'll use a helper _tokenize(text) -> list[list[str]] (sentences -> words)
-        tokenized_corpus = []
-        for text in all_texts:
-            sentences = self._tokenize_to_sentences(text)
-            tokenized_corpus.extend(sentences)
-            
-        detector.learn_vocab(tokenized_corpus)
-        self.learned_phrases = detector.get_phrases()
-        
-        # Phase 2: Build Trie using learned phrases
-        print("Inserting into Trie...")
-        for text in all_texts:
-            self._process_and_insert(text)
-        
-        # Save the built model
-        try:
-            self.trie.save(self.model_path)
-            self.is_ready = True
-            print(f"Autocomplete index built with {count} records and saved to {self.model_path}.")
-        except Exception as e:
-            print(f"Failed to save Trie model: {e}")
+        detector.learn_vocab([s for text in texts for s in self._tokenize_to_sentences(text)])
+        phrases = detector.get_phrases()
+
+        trie = Trie()
+        for text in texts:
+            self._process_and_insert(text, trie, phrases)
+        return trie, phrases
 
     def _get_smart_suffix(self, words: list, start_index: int, limit: int = 3) -> str:
         """
@@ -218,13 +314,13 @@ class AutocompleteManager:
                 result.append(words)
         return result
 
-    def _process_and_insert(self, text: str, is_phrase: bool = False):
+    def _process_and_insert(self, text: str, trie: Trie, learned_phrases: Set[str]):
         # reuse tokenize helper
         sentences = self._tokenize_to_sentences(text)
 
         for words in sentences:
-            # 1. Apply Phrase Merging based on self.learned_phrases
-            if self.learned_phrases:
+            # 1. Apply Phrase Merging based on the learned phrases
+            if learned_phrases:
                 merged_words = []
                 skip_next = False
                 for k in range(len(words)):
@@ -237,7 +333,7 @@ class AutocompleteManager:
                     if k < len(words) - 1:
                         next_word = words[k+1]
                         bg = f"{word} {next_word}"
-                        if bg in self.learned_phrases:
+                        if bg in learned_phrases:
                             merged_words.append(bg)
                             skip_next = True
                             continue
@@ -254,7 +350,7 @@ class AutocompleteManager:
                 # Note: words list now contains merged phrases like "san francisco"
                 suffix_phrase = self._get_smart_suffix(words, i, limit=3)
                 
-                self.trie.insert(word, phrase=suffix_phrase)
+                trie.insert(word, phrase=suffix_phrase)
 
     def _smart_title_case(self, text: str) -> str:
         words = text.split()

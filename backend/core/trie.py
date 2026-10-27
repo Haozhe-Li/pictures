@@ -102,18 +102,15 @@ class Trie:
             self._collect_all(node.children[char], results, limit)
 
     def save(self, filepath: str):
-        """Serialize the Trie to a file."""
-        # Ensure directory exists
+        """Serialize the Trie to a file (atomically, so a reader never sees a partial write)."""
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, 'wb') as f:
+        tmp_path = f"{filepath}.tmp"
+        with open(tmp_path, 'wb') as f:
             pickle.dump(self, f)
+        os.replace(tmp_path, filepath)
 
     @classmethod
     def load(cls, filepath: str) -> 'Trie':
-        """Load the Trie from a file."""
-        try:
-            with open(filepath, 'rb') as f:
-                return pickle.load(f)
-        except Exception as e:
-            print(f"Error loading Trie: {e}")
-            return cls()
+        """Load the Trie from a file. Raises if the file is missing or unreadable."""
+        with open(filepath, 'rb') as f:
+            return pickle.load(f)
