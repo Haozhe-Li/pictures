@@ -18,9 +18,12 @@ class Settings:
     # incompatible, so it lives in a different collection (see scripts/migrate_text_model.py).
     COLLECTION_NAME = "gallery_rag_hybrid_v2"
     LEGACY_COLLECTION_NAME = "gallery_rag_hybrid"
-    # User-facing "collections" (albums). Each one is a point in its own Qdrant collection whose
-    # title+description embedding is the anchor that new images are matched against.
-    GALLERY_COLLECTIONS_NAME = "gallery_collections"
+    # User-facing "collections" (albums). Each one is a point in its own Qdrant collection holding
+    # its title+description embedded the way /search embeds a query (CLIP, MiniLM, BM25), so its
+    # photos can be found and ranked with the site's own search. New photos are matched against
+    # the MiniLM vector. v1 had no CLIP vector; its points are copied over on first startup.
+    GALLERY_COLLECTIONS_NAME = "gallery_collections_v2"
+    LEGACY_GALLERY_COLLECTIONS_NAME = "gallery_collections"
     # Cosine score on `dense-text` above which an image joins a collection. Each collection can
     # override it; this is the default a new one starts with.
     DEFAULT_COLLECTION_THRESHOLD = float(os.getenv("COLLECTION_DEFAULT_THRESHOLD", "0.5"))

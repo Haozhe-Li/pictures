@@ -81,20 +81,57 @@ class QdrantClientWrapper:
         await self._init_gallery_collections()
 
     async def _init_gallery_collections(self):
-        """Create the store for collection anchors (text vectors only) if it is missing."""
-        collections = await self.client.get_collections()
-        if any(c.name == settings.GALLERY_COLLECTIONS_NAME for c in collections.collections):
+        """
+        Create the store for collections if it is missing, with the same three vectors as the
+        images so a collection's text can be run as a search. The first time, the collections of
+        the v1 store (MiniLM + BM25 only) are copied over; their CLIP vector is added the first
+        time it is needed. The v1 store is left in place.
+        """
+        names = {c.name for c in (await self.client.get_collections()).collections}
+        if settings.GALLERY_COLLECTIONS_NAME in names:
             return
         await self.client.create_collection(
             collection_name=settings.GALLERY_COLLECTIONS_NAME,
             vectors_config={
-                "dense-text": VectorParams(size=settings.TEXT_DIM, distance=Distance.COSINE)
+                "dense-image": VectorParams(size=settings.CLIP_DIM, distance=Distance.COSINE),
+                "dense-text": VectorParams(size=settings.TEXT_DIM, distance=Distance.COSINE),
             },
             sparse_vectors_config={
                 "sparse": SparseVectorParams(index=models.SparseIndexParams(on_disk=False))
             },
         )
         print(f"Collection {settings.GALLERY_COLLECTIONS_NAME} created.")
+        if settings.LEGACY_GALLERY_COLLECTIONS_NAME not in names:
+            return
+        try:
+            copied, offset = 0, None
+            while True:
+                page, offset = await self.client.scroll(
+                    collection_name=settings.LEGACY_GALLERY_COLLECTIONS_NAME,
+                    limit=200,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=True,
+                )
+                if page:
+                    await self.client.upsert(
+                        collection_name=settings.GALLERY_COLLECTIONS_NAME,
+                        points=[
+                            models.PointStruct(id=p.id, vector=p.vector, payload=p.payload)
+                            for p in page
+                        ],
+                    )
+                    copied += len(page)
+                if offset is None:
+                    break
+        except Exception:
+            # Start over on the next startup rather than run with half the collections
+            await self.client.delete_collection(settings.GALLERY_COLLECTIONS_NAME)
+            raise
+        print(
+            f"Copied {copied} collection(s) from {settings.LEGACY_GALLERY_COLLECTIONS_NAME} "
+            f"to {settings.GALLERY_COLLECTIONS_NAME}."
+        )
 
     async def upsert_point(
         self,
@@ -130,26 +167,34 @@ class QdrantClientWrapper:
         limit: int = 10,
         similarity_threshold: Optional[float] = None,
         search_mode: str = "hybrid",
+        query_filter: Optional[models.Filter] = None,
+        offset: int = 0,
+        prefetch_limit: Optional[int] = None,
+        with_vectors: Any = False,
     ):
         """
         `image_vector` is a CLIP vector, queried against `dense-image`.
         `text_vector` is a MiniLM vector, queried against `dense-text`.
-        Each mode only needs the vectors it uses.
+        Each mode only needs the vectors it uses. `query_filter` narrows every list before they
+        are fused; `prefetch_limit` is how many each list contributes (default twice the page).
         """
+        per_list = prefetch_limit or (offset + limit) * 2
         sparse_prefetch = models.Prefetch(
             query=models.SparseVector(
                 indices=sparse_vector["indices"],
                 values=sparse_vector["values"],
             ),
             using="sparse",
-            limit=limit * 2,
+            filter=query_filter,
+            limit=per_list,
         )
 
         def dense_prefetch(vector, using):
             return models.Prefetch(
                 query=vector,
                 using=using,
-                limit=limit * 2,
+                filter=query_filter,
+                limit=per_list,
                 score_threshold=similarity_threshold,
             )
 
@@ -169,11 +214,14 @@ class QdrantClientWrapper:
         search_result = await self.client.query_points(
             collection_name=settings.COLLECTION_NAME,
             limit=limit,
+            offset=offset,
             prefetch=prefetch,
             query=models.FusionQuery(
                 fusion=models.Fusion.RRF,
             ),
+            query_filter=query_filter,
             with_payload=True,
+            with_vectors=with_vectors,
         )
         return search_result.points
 
@@ -278,61 +326,31 @@ class QdrantClientWrapper:
                 ],
             )
 
-    async def search_images_by_text_vector(
-        self, text_vector: List[float], limit: int, score_threshold: Optional[float] = None
-    ):
-        """Images ranked by cosine similarity of their `dense-text` vector to `text_vector`."""
-        res = await self.client.query_points(
-            collection_name=settings.COLLECTION_NAME,
-            query=text_vector,
-            using="dense-text",
-            limit=limit,
-            score_threshold=score_threshold,
-            with_payload=True,
-        )
-        return res.points
-
-    async def query_collection_images(
-        self,
-        collection_id: str,
-        anchor_vector: List[float],
-        limit: int,
-        offset: int = 0,
-    ):
-        """
-        The images of one collection, closest to its anchor first, so the most representative
-        come first and the first one is the natural cover. Paged with a plain offset.
-        """
-        res = await self.client.query_points(
-            collection_name=settings.COLLECTION_NAME,
-            query=anchor_vector,
-            using="dense-text",
-            query_filter=self.collection_filter(collection_id),
-            limit=limit,
-            offset=offset,
-            with_payload=True,
-        )
-        return res.points
+    @staticmethod
+    def _collection_vectors(vectors: Dict[str, Any]) -> Dict[str, Any]:
+        """`vectors` as Qdrant takes them: the sparse one as a SparseVector."""
+        return {
+            name: (
+                models.SparseVector(indices=v["indices"], values=v["values"])
+                if name == "sparse"
+                else v
+            )
+            for name, v in vectors.items()
+        }
 
     async def upsert_gallery_collection(
         self,
         collection_id: str,
-        text_dense_vector: List[float],
-        sparse_vector: Dict[str, Any],
+        vectors: Dict[str, Any],
         payload: Dict[str, Any],
     ):
+        """`vectors` holds `dense-image`, `dense-text` and `sparse` (as {'indices', 'values'})."""
         await self.client.upsert(
             collection_name=settings.GALLERY_COLLECTIONS_NAME,
             points=[
                 models.PointStruct(
                     id=collection_id,
-                    vector={
-                        "dense-text": text_dense_vector,
-                        "sparse": models.SparseVector(
-                            indices=sparse_vector["indices"],
-                            values=sparse_vector["values"],
-                        ),
-                    },
+                    vector=self._collection_vectors(vectors),
                     payload=payload,
                 )
             ],
@@ -342,52 +360,45 @@ class QdrantClientWrapper:
         self,
         collection_id: str,
         payload: Dict[str, Any],
-        text_dense_vector: Optional[List[float]] = None,
-        sparse_vector: Optional[Dict[str, Any]] = None,
+        vectors: Optional[Dict[str, Any]] = None,
     ):
-        """Merge `payload`; replace the anchor vectors too when they are given."""
+        """Merge `payload`; replace (some of) the collection's vectors too when given."""
         operations: List[Any] = []
-        if text_dense_vector is not None and sparse_vector is not None:
+        if vectors:
             operations.append(
                 models.UpdateVectorsOperation(
                     update_vectors=models.UpdateVectors(
                         points=[
                             models.PointVectors(
-                                id=collection_id,
-                                vector={
-                                    "dense-text": text_dense_vector,
-                                    "sparse": models.SparseVector(
-                                        indices=sparse_vector["indices"],
-                                        values=sparse_vector["values"],
-                                    ),
-                                },
+                                id=collection_id, vector=self._collection_vectors(vectors)
                             )
                         ]
                     )
                 )
             )
-        operations.append(
-            models.SetPayloadOperation(
-                set_payload=models.SetPayload(payload=payload, points=[collection_id])
+        if payload:
+            operations.append(
+                models.SetPayloadOperation(
+                    set_payload=models.SetPayload(payload=payload, points=[collection_id])
+                )
             )
-        )
         await self.client.batch_update_points(
             collection_name=settings.GALLERY_COLLECTIONS_NAME,
             update_operations=operations,
         )
 
     async def get_gallery_collection(self, collection_id: str):
-        """The collection point, with its `dense-text` anchor vector."""
+        """The collection point, with its vectors."""
         points = await self.client.retrieve(
             collection_name=settings.GALLERY_COLLECTIONS_NAME,
             ids=[collection_id],
             with_payload=True,
-            with_vectors=["dense-text"],
+            with_vectors=True,
         )
         return points[0] if points else None
 
     async def list_gallery_collections(self):
-        """Every collection (there are only ever a handful), with its `dense-text` anchor vector."""
+        """Every collection (there are only ever a handful), with its vectors."""
         points, offset = [], None
         while True:
             page, offset = await self.client.scroll(
@@ -395,7 +406,7 @@ class QdrantClientWrapper:
                 limit=200,
                 offset=offset,
                 with_payload=True,
-                with_vectors=["dense-text"],
+                with_vectors=True,
             )
             points.extend(page)
             if offset is None:

@@ -1,4 +1,5 @@
 import asyncio
+import math
 import uuid
 import os
 import re
@@ -242,6 +243,31 @@ async def _embed_metadata(
         )
 
     return metadata_text, sparse_vec, text_dense_embedding
+
+
+async def _embed_query(query: str, search_mode: Optional[SearchMode] = None):
+    """
+    Embeds a search query for the indexes `search_mode` (default hybrid) uses: CLIP for
+    `dense-image`, MiniLM for `dense-text`, BM25 for `sparse`. Returns (image, text, sparse);
+    a vector the mode does not use is None. Shared by /search and collections, so a collection
+    is searched exactly like the site's search box would search its text.
+    """
+    mode = search_mode or SearchMode.HYBRID
+    use_image = mode != SearchMode.TEXT_ONLY
+    use_text = mode != SearchMode.IMAGE_ONLY
+
+    async def dense(model: str):
+        return await run_in_threadpool(
+            embedding_client.get_embedding, text=query, is_query=True, model=model
+        )
+
+    # Dense ones are issued together; the service queues them on its single worker.
+    image_vec, text_vec = await asyncio.gather(
+        dense(settings.CLIP_MODEL) if use_image else _none(),
+        dense(settings.TEXT_MODEL) if use_text else _none(),
+    )
+    sparse_vec = await run_in_threadpool(get_sparse_embedding, query)
+    return image_vec, text_vec, sparse_vec
 
 
 async def _ingest_bytes(
@@ -791,10 +817,14 @@ async def admin_describe_image(
 
 # --- Admin: collections ---
 #
-# A collection is a user-facing group of images. Its title+description is embedded like an
-# image's text (`dense-text` MiniLM + `sparse` BM25) and kept as the collection's anchor in a
-# separate Qdrant collection; the images carry their membership in `collection_ids`.
-# Only the dense score decides automatic assignment (BM25 scores have no fixed scale).
+# A collection is a user-facing group of images. Its title+description is embedded the way
+# /search embeds a query (CLIP + MiniLM + BM25) and kept in a separate Qdrant collection; the
+# images carry their membership in `collection_ids`.
+#
+# Collection -> images (the review when creating one, the order of its page, its cover) runs that
+# text through the site's hybrid search. Image -> collections (automatic assignment) needs a yes
+# or no, which the fused search score cannot give: RRF only reflects rank, and every query has a
+# first result. So that direction compares MiniLM vectors against a cosine threshold.
 
 
 class CollectionInfo(BaseModel):
@@ -837,12 +867,13 @@ class CollectionPreviewRequest(BaseModel):
     title: str
     description: Optional[str] = None
     limit: int = Field(200, ge=1, le=500)
-    min_score: float = Field(0.2, ge=-1, le=1)
 
 
 class CollectionPreviewResponse(BaseModel):
-    # Existing images ranked by similarity to the draft collection. `metadata` carries each
-    # image's current `collection_ids`, so the UI can tell which ones are already placed.
+    # Existing images in the order the site's search ranks them for the draft's text. Each
+    # `score` is the image's MiniLM cosine to that text, the number thresholds are compared
+    # with. `metadata` carries the image's current `collection_ids`, so the UI can tell which
+    # ones are already placed.
     items: List[SearchResult]
     default_threshold: float
 
@@ -980,15 +1011,87 @@ async def _change_membership(
     )
 
 
-def _anchor_vector(point) -> Optional[List[float]]:
-    vector = getattr(point, "vector", None)
-    return vector.get("dense-text") if isinstance(vector, dict) else vector
+def _collection_text(title: str, description: Optional[str]) -> str:
+    """What a collection is searched and matched by."""
+    return f"{title} {description or ''}".strip()
+
+
+async def _embed_collection(title: str, description: Optional[str]) -> dict:
+    """A collection's three vectors, keyed by the index each one is queried against."""
+    try:
+        image_vec, text_vec, sparse_vec = await _embed_query(_collection_text(title, description))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+    return {"dense-image": image_vec, "dense-text": text_vec, "sparse": sparse_vec}
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
+    return dot / norm if norm else 0.0
+
+
+async def _collection_query(point):
+    """
+    The collection's (CLIP, MiniLM, BM25) query vectors. Collections copied from the v1 store
+    have no CLIP vector yet; it is embedded and stored the first time it is needed. If that
+    fails, CLIP is None and the collection is searched on its text alone for now.
+    """
+    vectors = point.vector if isinstance(point.vector, dict) else {}
+    clip = vectors.get("dense-image")
+    if clip is None:
+        payload = point.payload or {}
+        try:
+            clip = await run_in_threadpool(
+                embedding_client.get_embedding,
+                text=_collection_text(payload.get("title", ""), payload.get("description")),
+                is_query=True,
+                model=settings.CLIP_MODEL,
+            )
+            await qdrant_wrapper.update_gallery_collection(
+                str(point.id), {}, vectors={"dense-image": clip}
+            )
+        except Exception as e:
+            print(f"Warning: could not add a CLIP vector to collection {point.id}: {e}")
+            clip = None
+    sparse = qdrant_wrapper.normalize_sparse_vector(vectors.get("sparse"))
+    return clip, vectors.get("dense-text"), sparse
+
+
+async def _rank_members(point, limit: int, offset: int, total: int):
+    """
+    A page of the collection's images, in the order the site's search ranks them for the
+    collection's own text: the most representative first.
+    """
+    clip, text, sparse = await _collection_query(point)
+    return await qdrant_wrapper.search(
+        image_vector=clip,
+        text_vector=text,
+        sparse_vector=sparse,
+        limit=limit,
+        offset=offset,
+        search_mode=SearchMode.HYBRID if clip is not None else SearchMode.TEXT_ONLY,
+        query_filter=qdrant_wrapper.collection_filter(str(point.id)),
+        # Each dense list then holds every member, so paging reaches all of them
+        prefetch_limit=max(total, offset + limit),
+    )
+
+
+def _offset_cursor(cursor: Optional[str]) -> int:
+    """Collection image lists page by position; the cursor is the next offset."""
+    try:
+        offset = int(cursor) if cursor else 0
+        if offset < 0:
+            raise ValueError
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+    return offset
 
 
 async def _collection_cover(point, image_count: int) -> Optional[dict]:
     """
     Payload of the collection's cover image: the admin's pick while it is still a member,
-    otherwise the member closest to the collection's anchor (the most representative one).
+    otherwise the member the search ranks first for the collection's text.
     """
     collection_id = str(point.id)
     cover_id = (point.payload or {}).get("cover_image_id")
@@ -998,12 +1101,11 @@ async def _collection_cover(point, image_count: int) -> Optional[dict]:
             if candidate and collection_id in gc.current_membership(candidate.payload or {}):
                 return candidate.payload or {}
         except Exception:
-            pass  # a deleted or invalid cover falls back to the anchor's nearest image
-    anchor = _anchor_vector(point)
-    if image_count and anchor:
-        nearest = await qdrant_wrapper.query_collection_images(collection_id, anchor, limit=1)
-        if nearest:
-            return nearest[0].payload or {}
+            pass  # a deleted or invalid cover falls back to the best-ranked member
+    if image_count:
+        best = await _rank_members(point, limit=1, offset=0, total=image_count)
+        if best:
+            return best[0].payload or {}
     return None
 
 
@@ -1053,14 +1155,11 @@ async def admin_create_collection(
                 status_code=400, detail=f"Unknown image(s): {', '.join(missing)}"
             )
 
-    _, sparse_vec, text_dense_embedding = await _embed_metadata(
-        title, description, None, None
-    )
+    vectors = await _embed_collection(title, description)
     collection_id = str(uuid.uuid4())
     await qdrant_wrapper.upsert_gallery_collection(
         collection_id=collection_id,
-        text_dense_vector=text_dense_embedding,
-        sparse_vector=sparse_vec,
+        vectors=vectors,
         payload={
             "title": title,
             "description": description,
@@ -1092,18 +1191,27 @@ async def admin_preview_collection(
     req: CollectionPreviewRequest, username: str = Depends(verify_credentials)
 ):
     """
-    Review step for a new (or extended) collection: embeds the draft title+description and
-    returns the existing images closest to it, best first, with their cosine scores.
-    Nothing is written. The UI filters by threshold locally and then sends the kept ids to
-    `POST /admin/collections`.
+    Review step for a new (or extended) collection: runs the draft title+description through
+    the site's hybrid search and returns the results in that order, each scored with its
+    MiniLM cosine to the text (what thresholds compare). Nothing is written. The UI pre-selects
+    by threshold locally and then sends the kept ids to `POST /admin/collections`.
     """
     title = req.title.strip()
     if not title:
         raise HTTPException(status_code=400, detail="Title cannot be empty")
-    _, _, vector = await _embed_metadata(title, (req.description or "").strip() or None, None, None)
-    points = await qdrant_wrapper.search_images_by_text_vector(
-        vector, limit=req.limit, score_threshold=req.min_score
+    vectors = await _embed_collection(title, (req.description or "").strip() or None)
+    points = await qdrant_wrapper.search(
+        image_vector=vectors["dense-image"],
+        text_vector=vectors["dense-text"],
+        sparse_vector=vectors["sparse"],
+        limit=req.limit,
+        with_vectors=["dense-text"],
     )
+
+    def cosine(p) -> float:
+        stored = p.vector.get("dense-text") if isinstance(p.vector, dict) else None
+        return _cosine(vectors["dense-text"], stored) if stored else 0.0
+
     return CollectionPreviewResponse(
         items=[
             SearchResult(
@@ -1111,7 +1219,7 @@ async def admin_preview_collection(
                 preview_url=(p.payload or {}).get("preview_url", ""),
                 original_url=(p.payload or {}).get("original_url", ""),
                 metadata=p.payload or {},
-                score=p.score,
+                score=cosine(p),
             )
             for p in points
         ],
@@ -1184,14 +1292,11 @@ async def admin_update_collection(
 
     changed = {k: v for k, v in updates.items() if payload.get(k) != v}
     if changed:
-        vectors = {}
+        vectors = None
         if "title" in changed or "description" in changed:
             merged = {**payload, **changed}
-            _, sparse_vec, text_dense_embedding = await _embed_metadata(
-                merged.get("title", ""), merged.get("description"), None, None
-            )
-            vectors = {"text_dense_vector": text_dense_embedding, "sparse_vector": sparse_vec}
-        await qdrant_wrapper.update_gallery_collection(collection_id, changed, **vectors)
+            vectors = await _embed_collection(merged.get("title", ""), merged.get("description"))
+        await qdrant_wrapper.update_gallery_collection(collection_id, changed, vectors=vectors)
         _invalidate_collections_cache()
     return await _collection_info(await _require_collection(collection_id))
 
@@ -1231,19 +1336,18 @@ async def admin_collection_images(
     cursor: Optional[str] = None,
     username: str = Depends(verify_credentials),
 ):
-    """Paginated images of one collection, shaped like `GET /admin/images`."""
-    await _require_collection(collection_id)
-    members = qdrant_wrapper.collection_filter(collection_id)
-    try:
-        points, next_cursor = await qdrant_wrapper.scroll(
-            limit=limit, offset=cursor, scroll_filter=members
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not list images: {e}")
+    """
+    Paginated images of one collection, shaped like `GET /admin/images`, in the same order as
+    on the site (most representative first).
+    """
+    point = await _require_collection(collection_id)
+    offset = _offset_cursor(cursor)
+    total = await qdrant_wrapper.count(qdrant_wrapper.collection_filter(collection_id))
+    points = await _rank_members(point, limit, offset, total) if offset < total else []
     return AdminImageList(
         items=[_to_search_result(str(p.id), p.payload or {}) for p in points],
-        next_cursor=str(next_cursor) if next_cursor is not None else None,
-        total=await qdrant_wrapper.count(members),
+        next_cursor=str(offset + limit) if offset + limit < total else None,
+        total=total,
     )
 
 
@@ -1339,24 +1443,14 @@ async def get_collection_images(
     cursor: Optional[str] = None,
 ):
     """
-    The images of a collection, most representative (closest to its anchor) first. Pass the
-    returned `next_cursor` to get the following page.
+    The images of a collection, most representative first: in the order the site's search
+    ranks them for the collection's text. Pass the returned `next_cursor` to get the following
+    page.
     """
     point = await _require_collection(collection_id)
-    try:
-        offset = int(cursor) if cursor else 0
-        if offset < 0:
-            raise ValueError
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid cursor")
-
+    offset = _offset_cursor(cursor)
     total = await qdrant_wrapper.count(qdrant_wrapper.collection_filter(collection_id))
-    anchor = _anchor_vector(point)
-    points = (
-        await qdrant_wrapper.query_collection_images(collection_id, anchor, limit, offset)
-        if anchor and offset < total
-        else []
-    )
+    points = await _rank_members(point, limit, offset, total) if offset < total else []
     return CollectionImages(
         items=[
             SearchResult(
@@ -1385,21 +1479,7 @@ async def search_images(request: SearchRequest):
     """
     try:
         print("Getting embeddings for search query...")
-        use_image = request.search_mode != SearchMode.TEXT_ONLY
-        use_text = request.search_mode != SearchMode.IMAGE_ONLY
-
-        async def dense(model: str):
-            return await run_in_threadpool(
-                embedding_client.get_embedding, text=request.query, is_query=True, model=model
-            )
-
-        # 1+2. Dense. Issued together; the service queues them on its single worker.
-        image_vec, text_vec = await asyncio.gather(
-            dense(settings.CLIP_MODEL) if use_image else _none(),
-            dense(settings.TEXT_MODEL) if use_text else _none(),
-        )
-        # 3. Sparse (Text)
-        sparse_vec = await run_in_threadpool(get_sparse_embedding, request.query)
+        image_vec, text_vec, sparse_vec = await _embed_query(request.query, request.search_mode)
 
         print("Searching Qdrant...")
         # 4. Search

@@ -377,19 +377,31 @@ original from R2).
 All endpoints below **require Authentication (Basic Auth)**.
 
 A collection is a user-facing group of images (not a Qdrant collection). Its title and description are
-embedded like an image's text (`dense-text` MiniLM + `sparse` BM25) and stored as the collection's
-*anchor* in the Qdrant collection `gallery_collections`. Images carry their membership in the payload:
+embedded the way `/search` embeds a query (CLIP for `dense-image`, MiniLM for `dense-text`, BM25 for
+`sparse`) and stored as the collection's *anchor* in the Qdrant collection `gallery_collections_v2`.
+Images carry their membership in the payload:
 
 - `collection_ids`: the collections the image is in. An image can be in several.
 - `collections_opt_out`: `true` once an admin deliberately left the image in none (removed it from its
   last collection, or chose none on upload/edit), so automatic assignment never puts it back.
 
-**Automatic assignment** compares the image's stored `dense-text` vector with each anchor by cosine
-score (BM25 scores have no fixed scale, so only the dense score counts) and joins every collection whose
-score reaches its own `threshold` (default `COLLECTION_DEFAULT_THRESHOLD`, 0.5). It only ever applies to
-an image with no collection that has not opted out; an image that already has collections is never
-changed automatically. If matching fails the image simply lands in none. A new collection reaches the
-existing images through the review step (12.2), not silently.
+The two directions use the anchor differently:
+
+- **Collection → images** (the review in 12.2, the order of a collection's images in 12.6 and 13.3, the
+  default cover): the collection's text is run through the site's own hybrid search (the three vectors,
+  fused with RRF), so keyword and picture matches count, not only similar wording.
+- **Image → collections** (automatic assignment): needs a yes or no, which a fused search score cannot
+  give (RRF only reflects rank; every query has a first result). So it compares the image's `dense-text`
+  vector with each anchor's by cosine and joins every collection whose score reaches its own `threshold`
+  (default `COLLECTION_DEFAULT_THRESHOLD`, 0.5). It only ever applies to an image with no collection that
+  has not opted out; an image that already has collections is never changed automatically. If matching
+  fails the image simply lands in none. A new collection reaches the existing images through the review
+  step (12.2), not silently.
+
+**Upgrading from `gallery_collections`** (MiniLM + BM25 only): on first startup the collections are
+copied into `gallery_collections_v2`; the old store is left in place and can be deleted afterwards. Each
+copied collection gets its CLIP vector the first time it is needed (if the embedding service is down then,
+it is searched on its text alone and the CLIP vector is added on a later request).
 
 ### 12.1 List / Get Collections
 
@@ -407,18 +419,17 @@ existing images through the review step (12.2), not silently.
   }]
   ```
   `cover_image_id` is the admin's explicit choice. While it is `null` (or that image has been deleted or
-  left the collection) the cover is the collection's image **closest to its anchor**, i.e. the most
-  representative one.
+  left the collection) the cover is the image the search ranks first for the collection's text, i.e. the
+  most representative one.
 - **Errors**: `404` unknown id.
 
 ### 12.2 Review Matches for a New Collection
 
-Embeds a draft title and description and returns the existing images closest to it. **Nothing is
-written.** The UI filters by threshold locally, lets the admin tick which to keep, then calls 12.3.
+Runs a draft title and description through the site's hybrid search and returns the results. **Nothing
+is written.** The UI pre-selects by threshold locally, lets the admin tick which to keep, then calls 12.3.
 
 - **URL**: `POST /admin/collections/preview`
-- **Request Body (JSON)**: `title` (required), `description`, `limit` (1-500, default 200),
-  `min_score` (cosine floor, default 0.2).
+- **Request Body (JSON)**: `title` (required), `description`, `limit` (1-500, default 200).
 - **Response Example**:
   ```json
   {
@@ -427,7 +438,9 @@ written.** The UI filters by threshold locally, lets the admin tick which to kee
     "default_threshold": 0.5
   }
   ```
-  Best match first. `metadata.collection_ids` shows which images are already in other collections.
+  In search order. Each `score` is the image's MiniLM cosine to the text (what thresholds compare), so an
+  image the search ranks high on keywords or looks alone can sit near the top with a low score: shown,
+  but not pre-selected. `metadata.collection_ids` shows which images are already in other collections.
 - **Errors**: `400` blank title.
 
 ### 12.3 Create a Collection
@@ -444,7 +457,7 @@ written.** The UI filters by threshold locally, lets the admin tick which to kee
 - **URL**: `PATCH /admin/collections/{id}`
 - **Request Body (JSON)**: any of `title`, `description` (empty clears), `threshold`, `cover_image_id`
   (empty clears; must be an image in the collection).
-- Changing the title or description re-embeds the anchor. **Members are left as they are**; run 12.2 again
+- Changing the title or description re-embeds the anchor (all three vectors). **Members are left as they are**; run 12.2 again
   to find more images. A new threshold only affects future matching.
 - **Response**: the collection. **Errors**: `404` unknown id, `400` blank title / bad cover.
 
@@ -461,7 +474,8 @@ written.** The UI filters by threshold locally, lets the admin tick which to kee
 ### 12.6 List a Collection's Images
 
 - **URL**: `GET /admin/collections/{id}/images?limit=40&cursor=...`
-- **Response**: same shape as `GET /admin/images` (`items`, `next_cursor`, `total`).
+- **Response**: same shape as `GET /admin/images` (`items`, `next_cursor`, `total`), in the same order as
+  13.3. The cursor is a position; pass back `next_cursor`.
 - **Errors**: `404` unknown id.
 
 ### 12.7 Add / Remove Images (multi-select)
@@ -514,7 +528,8 @@ same instance (membership, edits, deletes, ingest into a collection).
     "cover_preview_url": "https://cdn.haozheli.com/uuid_preview.webp"
   }]
   ```
-  The cover is the image closest to the collection's anchor unless the admin picked one (see 12.1).
+  The cover is the image the search ranks first for the collection's text unless the admin picked one
+  (see 12.1).
 
 ### 13.2 Get a Collection
 
@@ -534,6 +549,7 @@ same instance (membership, edits, deletes, ingest into a collection).
     "total": 48
   }
   ```
-  Ordered by closeness to the collection's anchor, so the most representative images come first
-  (`score` is that cosine similarity). `next_cursor` is `null` on the last page.
+  In the order the site's search ranks the members for the collection's text, so the most representative
+  images come first (`score` is the fused search score, only meaningful for ordering). `next_cursor` is
+  `null` on the last page.
 - **Errors**: `404` unknown id, `400` invalid cursor.
