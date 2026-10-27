@@ -406,8 +406,9 @@ existing images through the review step (12.2), not silently.
     "cover_preview_url": "https://cdn.haozheli.com/uuid_preview.webp"
   }]
   ```
-  `cover_image_id` is the admin's explicit choice; while it is `null` (or that image has been deleted or
-  left the collection) the cover is the collection's first image.
+  `cover_image_id` is the admin's explicit choice. While it is `null` (or that image has been deleted or
+  left the collection) the cover is the collection's image **closest to its anchor**, i.e. the most
+  representative one.
 - **Errors**: `404` unknown id.
 
 ### 12.2 Review Matches for a New Collection
@@ -491,3 +492,48 @@ For the upload and edit forms: which collections an image with this metadata wou
   ```
   Every collection, best first. Pre-select the `matched` ones; the rest are near misses.
 - **Errors**: `400` blank title.
+
+## 13. Collections (public)
+
+No authentication. Only collections that have at least one image are listed. `collections_opt_out` is
+internal and never appears in public image metadata; `collection_ids` does.
+
+The listing is kept in memory for up to 5 minutes and dropped immediately by any change made through the
+same instance (membership, edits, deletes, ingest into a collection).
+
+### 13.1 List Collections
+
+- **URL**: `GET /collections`
+- **Response Example**: largest collection first, ties by title.
+  ```json
+  [{
+    "id": "uuid-string",
+    "title": "Racing",
+    "description": "Grandstands, pit lanes and long straights",
+    "image_count": 48,
+    "cover_preview_url": "https://cdn.haozheli.com/uuid_preview.webp"
+  }]
+  ```
+  The cover is the image closest to the collection's anchor unless the admin picked one (see 12.1).
+
+### 13.2 Get a Collection
+
+- **URL**: `GET /collections/{collection_id}`
+- **Response**: one collection in the shape above (an empty collection is returned too, with `image_count` 0).
+- **Errors**: `404` unknown id.
+
+### 13.3 List a Collection's Images
+
+- **URL**: `GET /collections/{collection_id}/images?limit=40&cursor=...`
+- **Query Parameters**: `limit` (1-100, default 40), `cursor` (the previous response's `next_cursor`).
+- **Response Example**:
+  ```json
+  {
+    "items": [{ "id": "uuid", "preview_url": "...", "original_url": "...", "score": 0.91, "metadata": { } }],
+    "next_cursor": "40",
+    "total": 48
+  }
+  ```
+  Ordered by closeness to the collection's anchor, so the most representative images come first
+  (`score` is that cosine similarity). `next_cursor` is `null` on the last page.
+- **Errors**: `404` unknown id, `400` invalid cursor.

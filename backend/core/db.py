@@ -292,6 +292,28 @@ class QdrantClientWrapper:
         )
         return res.points
 
+    async def query_collection_images(
+        self,
+        collection_id: str,
+        anchor_vector: List[float],
+        limit: int,
+        offset: int = 0,
+    ):
+        """
+        The images of one collection, closest to its anchor first, so the most representative
+        come first and the first one is the natural cover. Paged with a plain offset.
+        """
+        res = await self.client.query_points(
+            collection_name=settings.COLLECTION_NAME,
+            query=anchor_vector,
+            using="dense-text",
+            query_filter=self.collection_filter(collection_id),
+            limit=limit,
+            offset=offset,
+            with_payload=True,
+        )
+        return res.points
+
     async def upsert_gallery_collection(
         self,
         collection_id: str,
@@ -355,16 +377,17 @@ class QdrantClientWrapper:
         )
 
     async def get_gallery_collection(self, collection_id: str):
+        """The collection point, with its `dense-text` anchor vector."""
         points = await self.client.retrieve(
             collection_name=settings.GALLERY_COLLECTIONS_NAME,
             ids=[collection_id],
             with_payload=True,
-            with_vectors=False,
+            with_vectors=["dense-text"],
         )
         return points[0] if points else None
 
     async def list_gallery_collections(self):
-        """Every collection (there are only ever a handful)."""
+        """Every collection (there are only ever a handful), with its `dense-text` anchor vector."""
         points, offset = [], None
         while True:
             page, offset = await self.client.scroll(
@@ -372,7 +395,7 @@ class QdrantClientWrapper:
                 limit=200,
                 offset=offset,
                 with_payload=True,
-                with_vectors=False,
+                with_vectors=["dense-text"],
             )
             points.extend(page)
             if offset is None:

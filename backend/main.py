@@ -92,6 +92,11 @@ app.add_middleware(
 )
 
 
+def _public_metadata(payload: dict) -> dict:
+    """An image's payload minus the bookkeeping the site has no use for."""
+    return {k: v for k, v in (payload or {}).items() if k != "collections_opt_out"}
+
+
 @app.get("/autocomplete")
 async def autocomplete(q: str):
     """
@@ -119,7 +124,7 @@ async def get_image_by_id(image_id: str):
             preview_url=metadata.get("preview_url", ""),
             original_url=metadata.get("original_url", ""),
             score=1.0,  # Exact match by ID
-            metadata=metadata,
+            metadata=_public_metadata(metadata),
             id=image_id,
         )
     except Exception as e:
@@ -354,6 +359,8 @@ async def _ingest_bytes(
 
         # 8. New title/description text: refresh the autocomplete index after a quiet period
         autocomplete_manager.schedule_rebuild()
+        if membership["collection_ids"]:
+            _invalidate_collections_cache()
 
         return {
             "status": "success",
@@ -707,6 +714,8 @@ async def admin_update_image(
     # Autocomplete is built from titles and descriptions only
     if "title" in changed or "description" in changed:
         autocomplete_manager.schedule_rebuild()
+    if membership:
+        _invalidate_collections_cache()
     return _to_search_result(image_id, merged)
 
 
@@ -735,6 +744,8 @@ async def admin_delete_image(
 
     await qdrant_wrapper.delete_point(image_id)
     autocomplete_manager.schedule_rebuild()
+    if gc.current_membership(payload):
+        _invalidate_collections_cache()
 
     try:
         pipe = redis_client.pipeline(transaction=False)
@@ -792,7 +803,7 @@ class CollectionInfo(BaseModel):
     description: Optional[str] = None
     threshold: float
     image_count: int
-    # Admin-chosen cover; when unset the cover is simply the first image of the collection
+    # Admin-chosen cover; when unset the cover is the image closest to the collection's anchor
     cover_image_id: Optional[str] = None
     cover_preview_url: Optional[str] = None
 
@@ -955,6 +966,7 @@ async def _change_membership(
         memberships[image_id] = gc.membership_payload(new_ids, by_admin)
     if memberships:
         await qdrant_wrapper.set_membership(memberships)
+        _invalidate_collections_cache()
     return MembershipResponse(
         updated=[
             MembershipItem(
@@ -968,24 +980,38 @@ async def _change_membership(
     )
 
 
-async def _collection_info(point) -> CollectionInfo:
-    collection_id = str(point.id)
-    payload = point.payload or {}
-    members = qdrant_wrapper.collection_filter(collection_id)
-    image_count = await qdrant_wrapper.count(members)
+def _anchor_vector(point) -> Optional[List[float]]:
+    vector = getattr(point, "vector", None)
+    return vector.get("dense-text") if isinstance(vector, dict) else vector
 
-    cover = None
-    cover_id = payload.get("cover_image_id")
+
+async def _collection_cover(point, image_count: int) -> Optional[dict]:
+    """
+    Payload of the collection's cover image: the admin's pick while it is still a member,
+    otherwise the member closest to the collection's anchor (the most representative one).
+    """
+    collection_id = str(point.id)
+    cover_id = (point.payload or {}).get("cover_image_id")
     if cover_id:
         try:
             candidate = await qdrant_wrapper.get_point(cover_id)
             if candidate and collection_id in gc.current_membership(candidate.payload or {}):
-                cover = candidate
+                return candidate.payload or {}
         except Exception:
-            pass  # a deleted cover falls back to the first image
-    if cover is None and image_count:
-        first, _ = await qdrant_wrapper.scroll(limit=1, scroll_filter=members)
-        cover = first[0] if first else None
+            pass  # a deleted or invalid cover falls back to the anchor's nearest image
+    anchor = _anchor_vector(point)
+    if image_count and anchor:
+        nearest = await qdrant_wrapper.query_collection_images(collection_id, anchor, limit=1)
+        if nearest:
+            return nearest[0].payload or {}
+    return None
+
+
+async def _collection_info(point) -> CollectionInfo:
+    collection_id = str(point.id)
+    payload = point.payload or {}
+    image_count = await qdrant_wrapper.count(qdrant_wrapper.collection_filter(collection_id))
+    cover = await _collection_cover(point, image_count)
 
     return CollectionInfo(
         id=collection_id,
@@ -993,8 +1019,8 @@ async def _collection_info(point) -> CollectionInfo:
         description=payload.get("description"),
         threshold=_collection_threshold(payload),
         image_count=image_count,
-        cover_image_id=cover_id,
-        cover_preview_url=(cover.payload or {}).get("preview_url") if cover else None,
+        cover_image_id=payload.get("cover_image_id"),
+        cover_preview_url=cover.get("preview_url") if cover else None,
     )
 
 
@@ -1057,6 +1083,7 @@ async def admin_create_collection(
             except Exception as e:
                 print(f"Warning: could not roll back collection {collection_id}: {e}")
             raise
+    _invalidate_collections_cache()
     return await _collection_info(await _require_collection(collection_id))
 
 
@@ -1165,6 +1192,7 @@ async def admin_update_collection(
             )
             vectors = {"text_dense_vector": text_dense_embedding, "sparse_vector": sparse_vec}
         await qdrant_wrapper.update_gallery_collection(collection_id, changed, **vectors)
+        _invalidate_collections_cache()
     return await _collection_info(await _require_collection(collection_id))
 
 
@@ -1192,6 +1220,7 @@ async def admin_delete_collection(
             member_ids[i : i + 200], [], [collection_id], by_admin=False
         )
     await qdrant_wrapper.delete_gallery_collection(collection_id)
+    _invalidate_collections_cache()
     return {"status": "deleted", "id": collection_id, "removed_images": len(member_ids)}
 
 
@@ -1237,6 +1266,111 @@ async def admin_change_membership(
         raise HTTPException(status_code=400, detail="Cannot add and remove the same collection")
     await _require_collections(add)
     return await _change_membership(image_ids, add, remove)
+
+
+# --- Collections: public ---
+
+
+class PublicCollection(BaseModel):
+    id: str
+    title: str
+    description: Optional[str] = None
+    image_count: int
+    cover_preview_url: Optional[str] = None
+
+
+class CollectionImages(BaseModel):
+    items: List[SearchResult]
+    next_cursor: Optional[str] = None
+    total: int
+
+
+# The menu of every page lists collections, so the (comparatively expensive) listing is kept
+# in memory. Any change made through this process drops it at once; the TTL only bounds how
+# stale it can get when another instance made the change.
+PUBLIC_COLLECTIONS_TTL_SECONDS = 300
+_public_collections_cache: dict = {"at": 0.0, "items": None, "generation": 0}
+
+
+def _invalidate_collections_cache():
+    _public_collections_cache["items"] = None
+    _public_collections_cache["generation"] += 1
+
+
+def _to_public_collection(info: CollectionInfo) -> PublicCollection:
+    return PublicCollection(
+        id=info.id,
+        title=info.title,
+        description=info.description,
+        image_count=info.image_count,
+        cover_preview_url=info.cover_preview_url,
+    )
+
+
+@app.get("/collections", response_model=List[PublicCollection])
+async def list_collections():
+    """
+    Every collection that has images, largest first (ties by title). The cover is the image
+    closest to the collection's anchor unless the admin picked one.
+    """
+    cache = _public_collections_cache
+    if cache["items"] is not None and time.time() - cache["at"] < PUBLIC_COLLECTIONS_TTL_SECONDS:
+        return cache["items"]
+
+    generation = cache["generation"]
+    points = await qdrant_wrapper.list_gallery_collections()
+    infos = await asyncio.gather(*(_collection_info(p) for p in points))
+    items = [_to_public_collection(i) for i in infos if i.image_count > 0]
+    items.sort(key=lambda c: (-c.image_count, c.title.lower()))
+    if generation == cache["generation"]:  # nothing changed while this was being built
+        cache.update(items=items, at=time.time())
+    return items
+
+
+@app.get("/collections/{collection_id}", response_model=PublicCollection)
+async def get_collection(collection_id: str):
+    return _to_public_collection(await _collection_info(await _require_collection(collection_id)))
+
+
+@app.get("/collections/{collection_id}/images", response_model=CollectionImages)
+async def get_collection_images(
+    collection_id: str,
+    limit: int = Query(40, ge=1, le=100),
+    cursor: Optional[str] = None,
+):
+    """
+    The images of a collection, most representative (closest to its anchor) first. Pass the
+    returned `next_cursor` to get the following page.
+    """
+    point = await _require_collection(collection_id)
+    try:
+        offset = int(cursor) if cursor else 0
+        if offset < 0:
+            raise ValueError
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+
+    total = await qdrant_wrapper.count(qdrant_wrapper.collection_filter(collection_id))
+    anchor = _anchor_vector(point)
+    points = (
+        await qdrant_wrapper.query_collection_images(collection_id, anchor, limit, offset)
+        if anchor and offset < total
+        else []
+    )
+    return CollectionImages(
+        items=[
+            SearchResult(
+                id=str(p.id),
+                preview_url=(p.payload or {}).get("preview_url", ""),
+                original_url=(p.payload or {}).get("original_url", ""),
+                metadata=_public_metadata(p.payload or {}),
+                score=p.score,
+            )
+            for p in points
+        ],
+        next_cursor=str(offset + limit) if offset + limit < total else None,
+        total=total,
+    )
 
 
 @app.post("/search", response_model=List[SearchResult])
@@ -1288,7 +1422,7 @@ async def search_images(request: SearchRequest):
                     id=str(hit.id),
                     preview_url=hit.payload.get("preview_url", ""),
                     original_url=hit.payload.get("original_url", ""),
-                    metadata=hit.payload,
+                    metadata=_public_metadata(hit.payload),
                     score=hit.score,
                 )
             )
@@ -1348,7 +1482,7 @@ async def similar_to_image(request: SimilarToRequest):
                     id=str(hit.id),
                     preview_url=hit.payload.get("preview_url", ""),
                     original_url=hit.payload.get("original_url", ""),
-                    metadata=hit.payload,
+                    metadata=_public_metadata(hit.payload),
                     score=hit.score,
                 )
             )
@@ -1424,7 +1558,7 @@ async def get_gallery(request: FeedRequest):
                         id=str(point.id),
                         preview_url=point.payload.get("preview_url", ""),
                         original_url=point.payload.get("original_url", ""),
-                        metadata=point.payload,
+                        metadata=_public_metadata(point.payload),
                         score=1.0,  # Default score for browsing
                     )
                 )
