@@ -497,12 +497,13 @@ async def _describe_bytes(file_bytes: bytes) -> GenerateDescriptionResponse:
 
         result = await description_generator.generate(image_base64)
 
-        if not result.get("title") or not result.get("description"):
+        title, description = result.title.strip(), result.description.strip()
+        if not title or not description:
             raise HTTPException(
                 status_code=500, detail="LLM response missing title or description"
             )
 
-        return GenerateDescriptionResponse(**result)
+        return GenerateDescriptionResponse(title=title, description=description)
 
     except HTTPException as he:
         raise he

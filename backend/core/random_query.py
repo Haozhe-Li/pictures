@@ -1,11 +1,14 @@
 import asyncio
 import json
 import random
-from typing import Any, Dict, List
+from typing import Dict, List
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 from core.config import settings
 from core.embedding import EmbeddingClient
-from core.generate_description import description_generator
+from core.generate_description import chat_model
 
 # Redis queue of ready-to-serve random queries. Each item is a JSON object
 # {"query": str, "image_id": str}; the image id only exists so a refill can avoid
@@ -32,8 +35,17 @@ Requirements:
 2) For each photo write ONE query of 3-8 lowercase English words that captures its mood, subject and, when present, the place.
 3) Do not copy the description verbatim. Reword and compress it; drop filler words and punctuation.
    Example: title "Where Daylight Lingers", description "Amber light spills across quiet streets and autumn canopies. Jacksonport, Lakeside Park Playground, Wisconsin" -> "daylight lingers on wisconsin autumn"
-4) Output **JSON only**: {"queries": ["...", "..."]} with exactly one query per photo, in the same order.
+4) Return exactly one query per photo, in the same order.
 """
+
+
+class QueryBatch(BaseModel):
+    """Search queries for a batch of photos."""
+
+    queries: List[str] = Field(description="One search query per photo, in the order listed.")
+
+
+_query_writer = chat_model.with_structured_output(QueryBatch)
 
 
 async def generate_random_query() -> str:
@@ -192,33 +204,24 @@ class RandomQueryManager:
         """One LLM call for the whole batch; titles stand in for anything it fails to return."""
         titles = [(img["title"] or img["description"]).lower() for img in images]
         try:
-            queries = await asyncio.to_thread(self._rewrite_queries_sync, images)
+            queries = await self._request_queries(images)
         except Exception as e:
             print(f"Random query LLM rewrite failed, using titles: {e}")
             return titles
         return [q or fallback for q, fallback in zip(queries, titles)]
 
     @staticmethod
-    def _rewrite_queries_sync(images: List[Dict[str, str]]) -> List[str]:
+    async def _request_queries(images: List[Dict[str, str]]) -> List[str]:
         listing = "\n".join(
             f"{n}. title: {img['title']} | description: {img['description']}"
             for n, img in enumerate(images, 1)
         )
-        completion = description_generator.client.chat.completions.create(
-            model=description_generator.model,
-            messages=[
-                {"role": "system", "content": QUERY_SYSTEM_PROMPT},
-                {"role": "user", "content": listing},
-            ],
-            max_completion_tokens=512,
-            stream=False,
-            response_format={"type": "json_object"},
+        batch = await _query_writer.ainvoke(
+            [SystemMessage(QUERY_SYSTEM_PROMPT), HumanMessage(listing)]
         )
-        data: Any = json.loads(completion.choices[0].message.content or "{}")
-        queries = data.get("queries")
-        if not isinstance(queries, list) or len(queries) != len(images):
-            raise ValueError(f"expected {len(images)} queries, got: {queries!r}")
-        return [str(q).strip() for q in queries]
+        if len(batch.queries) != len(images):
+            raise ValueError(f"expected {len(images)} queries, got: {batch.queries!r}")
+        return [q.strip() for q in batch.queries]
 
     async def _warm_embeddings(self, query: str) -> bool:
         """

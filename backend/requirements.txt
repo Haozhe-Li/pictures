@@ -9,4 +9,4 @@ fastembed
 onnxruntime
 Pillow
 redis
-openai
+langchain-openai
