@@ -236,6 +236,18 @@ class QdrantClientWrapper:
         )
         return search_result.points
 
+    async def nearest_images(self, image_vector: List[float], limit: int, min_score: float):
+        """The images whose CLIP vector is closest to `image_vector`, scoring at least `min_score`."""
+        res = await self.client.query_points(
+            collection_name=settings.COLLECTION_NAME,
+            query=image_vector,
+            using="dense-image",
+            limit=limit,
+            score_threshold=min_score,
+            with_payload=True,
+        )
+        return res.points
+
     async def scroll(
         self,
         limit: int = 20,

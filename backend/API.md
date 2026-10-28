@@ -124,6 +124,8 @@ Upload an image, generate embeddings (Dense + Sparse), and store metadata.
   - `description`: (String, Optional) Detailed description.
   - `taken_time`: (String, Optional) Date/Time taken, ideally `YYYY-MM-DD HH:MM:SS` (see *Photo times* in 12).
   - `camera`: (String, Optional) Camera model.
+  - `allow_duplicate`: (Boolean, Optional, default `false`) Ingest even if the image looks like one
+    already in the gallery (see *Duplicates* below).
 - **Response Example**:
   ```json
   {
@@ -134,6 +136,23 @@ Upload an image, generate embeddings (Dense + Sparse), and store metadata.
     "metadata_used_for_sparse": "Title Description ..."
   }
   ```
+
+**Duplicates.** The image's CLIP vector is computed first and compared with every image's
+`dense-image` vector. If any scores at least `DUPLICATE_THRESHOLD` (cosine, default 0.95), nothing is
+converted, published or stored, and the response is `409` with up to three matches, closest first:
+
+```json
+{ "detail": {
+    "message": "This photo looks like one already in the gallery",
+    "matches": [{ "id": "uuid", "title": "Pelicans", "preview_url": "https://...", "taken_time": "2024-07-01 10:00:00", "score": 0.9981 }]
+} }
+```
+
+Repeat the request with `allow_duplicate` set to ingest it anyway. The same file scores about 1.0 and
+a re-export a little less, but neighbouring burst shots can come close too, so this asks rather than
+refuses for good. To choose the threshold (and find photos already uploaded twice), run
+`python -m scripts.find_duplicates` from `backend/`: it lists how close each image's nearest other
+image is and the closest pairs.
 
 ### 4.1 Browser-direct upload (presign + ingest staged)
 
@@ -159,7 +178,7 @@ Returns one entry per file; `PUT` the raw file to `upload_url` with the same `Co
 
 ```json
 { "key": "staging/<uuid>.jpg", "title": "...", "description": null, "taken_time": null, "camera": null,
-  "collection_ids": ["<collection uuid>"] }
+  "collection_ids": ["<collection uuid>"], "allow_duplicate": false }
 ```
 
 `collection_ids` is optional: a list puts the image in exactly those collections (`[]` = none, and
@@ -167,8 +186,14 @@ that is remembered so it is never matched automatically later); leave it out to 
 the new image against the collections (see 12). Unknown collection ids are rejected (400) before
 anything is downloaded or published.
 
-Runs the same pipeline as `/ingest` and returns the same response, plus the image's `collection_ids`. Add an R2 lifecycle
-rule expiring the `staging/` prefix (e.g. after 1 day) to clean up uploads that were never ingested.
+Runs the same pipeline as `/ingest` and returns the same response, plus the image's `collection_ids`.
+A likely duplicate is refused with `409` as in 4; the staged object is kept, so the request can be
+repeated with `allow_duplicate: true` without uploading the file again.
+
+**Discarding: `POST /ingest/staged/discard`** (JSON `{ "key": "staging/<uuid>.jpg" }`) deletes a staged
+object that will not be ingested, e.g. a duplicate the admin skipped. `400` for a key outside
+`staging/`. Add an R2 lifecycle rule expiring the `staging/` prefix (e.g. after 1 day) as well, to
+clean up uploads that were neither ingested nor discarded.
 
 ## 5. Generate Random Query
 

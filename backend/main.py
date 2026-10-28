@@ -291,6 +291,32 @@ async def _embed_query(query: str, search_mode: Optional[SearchMode] = None):
     return image_vec, text_vec, sparse_vec
 
 
+class DuplicateMatch(BaseModel):
+    id: str
+    title: str
+    preview_url: str
+    taken_time: Optional[str] = None
+    # Cosine of the two images' CLIP vectors
+    score: float
+
+
+async def _duplicate_matches(image_vector: List[float]) -> List[DuplicateMatch]:
+    """Up to three images in the gallery that look like the same photo, closest first."""
+    points = await qdrant_wrapper.nearest_images(
+        image_vector, limit=3, min_score=settings.DUPLICATE_THRESHOLD
+    )
+    return [
+        DuplicateMatch(
+            id=str(p.id),
+            title=(p.payload or {}).get("title") or "Untitled",
+            preview_url=(p.payload or {}).get("preview_url", ""),
+            taken_time=(p.payload or {}).get("taken_time"),
+            score=round(p.score, 4),
+        )
+        for p in points
+    ]
+
+
 async def _ingest_bytes(
     file_bytes: bytes,
     title: str,
@@ -298,6 +324,7 @@ async def _ingest_bytes(
     camera: Optional[str],
     description: Optional[str],
     collection_ids: Optional[List[str]] = None,
+    allow_duplicate: bool = False,
 ):
     """
     Shared ingest pipeline (see /ingest for the steps). Takes the raw image bytes
@@ -305,36 +332,17 @@ async def _ingest_bytes(
 
     `collection_ids` is the admin's explicit choice of collections ([] = none, and it sticks);
     None lets the server match the new image against the collections' anchors.
+
+    An image that looks like one already in the gallery is refused with 409 and the closest
+    matches, before anything is written, unless `allow_duplicate` is set.
     """
     try:
-        # 1. Prepare filenames
-        file_uuid = uuid.uuid4()
-
-        # Generate filenames for R2 (WebP)
-        # Preview: quality 5, long edge 1200; Original: quality 90, long edge 3000
-        storage_filename_preview = f"{file_uuid}_preview.webp"
-        storage_filename_original = f"{file_uuid}_original.webp"
-
-        # Save temp files for R2 upload
-        temp_filename_preview = f"/tmp/{storage_filename_preview}"
-        temp_filename_original = f"/tmp/{storage_filename_original}"
-
-        # 1.1 Save Preview (Quality 5) with lower resolution
-        await run_in_threadpool(
-            save_as_webp, file_bytes, temp_filename_preview, 5, max_size=1200
-        )
-
-        # 1.2 Save Original (Quality 90)
-        await run_in_threadpool(save_as_webp, file_bytes, temp_filename_original, 90)
-
-        # Process image for embedding (Resize & Compress)
-        # We generally deliver the compressed version to embedding model to save bandwidth and meet limits.
-        # R2 gets the compressed WebP file via temp_filename logic.
+        # 1. CLIP vector of the image. It comes first, so a likely duplicate is caught before
+        #    anything is converted or published. The embedding service gets a downscaled JPEG.
         base64_str = await run_in_threadpool(process_image_for_embedding, file_bytes)
 
         print("Prepare to embed image via embedding service...")
 
-        # 2. Dense Embedding (Image)
         try:
             dense_embedding = await run_in_threadpool(
                 embedding_client.get_embedding, image_base64=base64_str
@@ -347,7 +355,40 @@ async def _ingest_bytes(
 
         print(f"Dense embedding length: {len(dense_embedding)}")
 
-        # 3. R2 Upload
+        # 2. The same photo may already be in the library under another name. The admin
+        #    decides: nothing is written, and the request can be repeated with allow_duplicate.
+        if not allow_duplicate:
+            matches = await _duplicate_matches(dense_embedding)
+            if matches:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "This photo looks like one already in the gallery",
+                        "matches": [m.model_dump() for m in matches],
+                    },
+                )
+
+        # 3. Prepare filenames
+        file_uuid = uuid.uuid4()
+
+        # Generate filenames for R2 (WebP)
+        # Preview: quality 5, long edge 1200; Original: quality 90, long edge 3000
+        storage_filename_preview = f"{file_uuid}_preview.webp"
+        storage_filename_original = f"{file_uuid}_original.webp"
+
+        # Save temp files for R2 upload
+        temp_filename_preview = f"/tmp/{storage_filename_preview}"
+        temp_filename_original = f"/tmp/{storage_filename_original}"
+
+        # 3.1 Save Preview (Quality 5) with lower resolution
+        await run_in_threadpool(
+            save_as_webp, file_bytes, temp_filename_preview, 5, max_size=1200
+        )
+
+        # 3.2 Save Original (Quality 90)
+        await run_in_threadpool(save_as_webp, file_bytes, temp_filename_original, 90)
+
+        # 4. R2 Upload
         try:
             # Upload the Preview WebP file
             r2_url_preview = await run_in_threadpool(
@@ -367,12 +408,12 @@ async def _ingest_bytes(
 
         print(f"Uploaded to R2. Preview: {r2_url_preview}, Original: {r2_url_original}")
 
-        # 4. Sparse + dense embedding of the metadata text
+        # 5. Sparse + dense embedding of the metadata text
         metadata_text, sparse_vec, text_dense_embedding = await _embed_metadata(
             title, description, taken_time, camera
         )
 
-        # 5. Collections: the admin's explicit choice, or whatever matches the anchors
+        # 6. Collections: the admin's explicit choice, or whatever matches the anchors
         taken_at = to_taken_at(taken_time)
         if collection_ids is None:
             member_ids = await _auto_collections(text_dense_embedding, taken_at)
@@ -380,7 +421,7 @@ async def _ingest_bytes(
         else:
             membership = gc.membership_payload(collection_ids, by_admin=True)
 
-        # 6. Qdrant Upsert
+        # 7. Qdrant Upsert
         point_id = str(file_uuid)
         payload = {
             "title": title,
@@ -402,11 +443,11 @@ async def _ingest_bytes(
             payload=payload,
         )
 
-        # 7. Add to Redis Pools for Waterfall Recommendation
+        # 8. Add to Redis Pools for Waterfall Recommendation
         await redis_client.zadd("gallery:pool:active", {point_id: 0})
         await redis_client.zadd("gallery:pool:explore", {point_id: 0})
 
-        # 8. New title/description text: refresh the autocomplete index after a quiet period
+        # 9. New title/description text: refresh the autocomplete index after a quiet period
         autocomplete_manager.schedule_rebuild()
         if membership["collection_ids"]:
             _invalidate_collections_cache()
@@ -435,12 +476,13 @@ async def ingest_image(
     taken_time: Optional[str] = Form(None),
     camera: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
+    allow_duplicate: bool = Form(False),
 ):
     """
     Ingest an image sent directly as multipart form data:
-    1. Read and Convert to Base64
-    2. Save Preview & Original Versions to R2
-    3. Get Dense Embedding from the embedding service
+    1. Get the image's dense (CLIP) embedding from the embedding service
+    2. Refuse it (409) if it looks like an image already in the gallery, unless allow_duplicate
+    3. Save Preview & Original Versions to R2
     4. Generate Sparse Embedding from Metadata
     5. Save to Qdrant
 
@@ -448,7 +490,9 @@ async def ingest_image(
     use /upload/presign + /ingest/staged instead.
     """
     file_bytes = await file.read()
-    return await _ingest_bytes(file_bytes, title, taken_time, camera, description)
+    return await _ingest_bytes(
+        file_bytes, title, taken_time, camera, description, allow_duplicate=allow_duplicate
+    )
 
 
 # --- Browser -> R2 -> backend upload flow ---
@@ -487,6 +531,12 @@ class StagedIngestRequest(BaseModel):
     description: Optional[str] = None
     # Explicit collections ([] = none); omit to let the server match the anchors
     collection_ids: Optional[List[str]] = None
+    # Ingest even if the image looks like one already in the gallery (after the admin saw the 409)
+    allow_duplicate: bool = False
+
+
+class StagedDiscardRequest(BaseModel):
+    key: str
 
 
 @app.post("/upload/presign", response_model=List[PresignedUpload])
@@ -553,6 +603,7 @@ async def ingest_staged_image(
         req.camera,
         req.description,
         collection_ids,
+        allow_duplicate=req.allow_duplicate,
     )
     try:
         await run_in_threadpool(delete_object, req.key)
@@ -560,6 +611,24 @@ async def ingest_staged_image(
         # The image is already published; a leftover staged object is swept by the lifecycle rule.
         print(f"Warning: failed to delete staged object {req.key}: {e}")
     return result
+
+
+@app.post("/ingest/staged/discard")
+async def discard_staged_image(
+    req: StagedDiscardRequest, username: str = Depends(verify_credentials)
+):
+    """
+    Delete a staged upload that will not be ingested, e.g. one the admin skipped as a
+    duplicate. A refused ingest keeps its staged object so it can be repeated without
+    uploading the file again.
+    """
+    if not STAGING_KEY_RE.match(req.key):
+        raise HTTPException(status_code=400, detail="Invalid staging key")
+    try:
+        await run_in_threadpool(delete_object, req.key)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not discard the upload: {e}")
+    return {"status": "discarded", "key": req.key}
 
 
 async def _describe_bytes(file_bytes: bytes) -> GenerateDescriptionResponse:

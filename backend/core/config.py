@@ -27,6 +27,10 @@ class Settings:
     # Cosine score on `dense-text` above which an image joins a collection. Each collection can
     # override it; this is the default a new one starts with.
     DEFAULT_COLLECTION_THRESHOLD = float(os.getenv("COLLECTION_DEFAULT_THRESHOLD", "0.5"))
+    # Cosine score on `dense-image` (CLIP) at or above which an upload is held back as a likely
+    # duplicate of a photo already in the library. The same file scores about 1.0, a re-export
+    # (resized, re-encoded) a little less; neighbouring burst shots can come close too.
+    DUPLICATE_THRESHOLD = float(os.getenv("DUPLICATE_THRESHOLD", "0.95"))
 
     # Self-hosted embedding service. Two dense models, each with its own job:
     #  - CLIP: text query <-> image (`dense-image`) and image <-> image. Shared text/image space.
