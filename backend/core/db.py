@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional
 from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.http.models import Distance, VectorParams, SparseVectorParams
 from core.config import settings
+from core.taken_at import to_taken_at, window_bounds
 
 
 class QdrantClientWrapper:
@@ -66,6 +67,16 @@ class QdrantClientWrapper:
             )
         except Exception as e:
             print(f"Warning: could not ensure payload index on original_url: {e}")
+
+        # Photo times (RFC 3339, see core/taken_at.py), for filtering by date
+        try:
+            await self.client.create_payload_index(
+                collection_name=settings.COLLECTION_NAME,
+                field_name="taken_at",
+                field_schema=models.PayloadSchemaType.DATETIME,
+            )
+        except Exception as e:
+            print(f"Warning: could not ensure payload index on taken_at: {e}")
 
         # Collection membership lives on the image points; listing a collection's images
         # filters on it.
@@ -296,6 +307,39 @@ class QdrantClientWrapper:
             points_selector=models.PointIdsList(points=[point_id]),
         )
 
+    async def backfill_taken_at(self) -> int:
+        """
+        Give every image the `taken_at` its `taken_time` reads as (images from before it existed,
+        or edited by hand in Qdrant). Only points that differ are written; returns how many.
+        """
+        updates, offset = {}, None
+        while True:
+            page, offset = await self.scroll(limit=500, offset=offset)
+            for p in page:
+                payload = p.payload or {}
+                wanted = to_taken_at(payload.get("taken_time"))
+                if payload.get("taken_at") != wanted and (wanted or "taken_at" in payload):
+                    updates[str(p.id)] = {"taken_at": wanted}
+            if offset is None:
+                break
+        if updates:
+            await self.set_payloads(updates)
+        return len(updates)
+
+    @staticmethod
+    def taken_between(start: Optional[str], end: Optional[str]) -> Optional[models.Filter]:
+        """Images taken within a window of whole days (YYYY-MM-DD, inclusive, either open)."""
+        if not start and not end:
+            return None
+        lower, upper = window_bounds(start, end)
+        return models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="taken_at", range=models.DatetimeRange(gte=lower, lt=upper)
+                )
+            ]
+        )
+
     # --- Collections (user-facing albums) ---
 
     @staticmethod
@@ -312,9 +356,14 @@ class QdrantClientWrapper:
     async def set_membership(self, memberships: Dict[str, Dict[str, Any]]):
         """
         Write `collection_ids` / `collections_opt_out` onto image points. `memberships`
-        maps point id -> the payload keys to set. Sent in batches, one operation per point.
+        maps point id -> the payload keys to set.
         """
-        items = list(memberships.items())
+        await self.set_payloads(memberships)
+
+    async def set_payloads(self, updates: Dict[str, Dict[str, Any]]):
+        """Merge payload keys into many image points (point id -> keys), in batches, one
+        operation per point."""
+        items = list(updates.items())
         for i in range(0, len(items), 200):
             await self.client.batch_update_points(
                 collection_name=settings.COLLECTION_NAME,

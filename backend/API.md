@@ -111,7 +111,7 @@ Upload an image, generate embeddings (Dense + Sparse), and store metadata.
   - `file`: (File, Required) The image file (jpg/png).
   - `title`: (String, Required) Image title.
   - `description`: (String, Optional) Detailed description.
-  - `taken_time`: (String, Optional) Date/Time taken.
+  - `taken_time`: (String, Optional) Date/Time taken, ideally `YYYY-MM-DD HH:MM:SS` (see *Photo times* in 12).
   - `camera`: (String, Optional) Camera model.
 - **Response Example**:
   ```json
@@ -337,6 +337,7 @@ Stable, paginated listing of every image (`/gallery` is a random feed and cannot
   membership is kept, except that an image in **no** collection that has **not** opted out is matched
   against the collections when its text changes, and joins those at or above their thresholds.
   Membership is written in the same request as the text and vectors.
+- **Time**: a new `taken_time` also updates `taken_at` (see *Photo times* in 12).
 - **Re-embedding**: the title, description, taken time and camera are all part of the indexed
   text, so any change recomputes the `sparse` and `dense-text` vectors (the `dense-image`
   vector is untouched). The vectors and payload are written in a single Qdrant request, and
@@ -393,10 +394,24 @@ The two directions use the anchor differently:
 - **Image → collections** (automatic assignment): needs a yes or no, which a fused search score cannot
   give (RRF only reflects rank; every query has a first result). So it compares the image's `dense-text`
   vector with each anchor's by cosine and joins every collection whose score reaches its own `threshold`
-  (default `COLLECTION_DEFAULT_THRESHOLD`, 0.5). It only ever applies to an image with no collection that
+  (default `COLLECTION_DEFAULT_THRESHOLD`, 0.5) and whose time window, if any, contains the photo's
+  `taken_at`. It only ever applies to an image with no collection that
   has not opted out; an image that already has collections is never changed automatically. If matching
   fails the image simply lands in none. A new collection reaches the existing images through the review
   step (12.2), not silently.
+
+**Photo times.** `taken_time` stays the text that is shown and embedded. Beside it each image carries
+`taken_at`, the same moment in RFC 3339 (`2024-07-15T14:32:10Z`) under a Qdrant `datetime` payload index
+(needs Qdrant 1.8+). It is written on ingest and whenever `taken_time` changes, and on startup any image
+whose `taken_at` does not match its `taken_time` is brought in step. Accepted `taken_time` forms:
+`YYYY-MM-DD HH:MM:SS` (what the upload form fills in from EXIF), raw EXIF `YYYY:MM:DD HH:MM:SS`,
+`YYYY-MM-DD HH:MM`, `YYYY-MM-DD`, and ISO 8601 (an offset is converted to UTC). Anything else, or no time,
+leaves `taken_at` empty. EXIF times have no time zone, so they are stored as if UTC, as the site shows them.
+
+**Time windows.** A collection can have a window of whole days, `window_start` / `window_end`
+(`YYYY-MM-DD`, both inclusive, either one open). With a window, the review (12.2) only searches photos
+taken inside it, and automatic assignment only puts a photo in the collection when it was taken inside it
+(a photo without `taken_at` is outside every window). Members already in the collection are not affected.
 
 **Upgrading from `gallery_collections`** (MiniLM + BM25 only): on first startup the collections are
 copied into `gallery_collections_v2`; the old store is left in place and can be deleted afterwards. Each
@@ -415,7 +430,9 @@ it is searched on its text alone and the CLIP vector is added on a later request
     "threshold": 0.5,
     "image_count": 12,
     "cover_image_id": null,
-    "cover_preview_url": "https://cdn.haozheli.com/uuid_preview.webp"
+    "cover_preview_url": "https://cdn.haozheli.com/uuid_preview.webp",
+    "window_start": "2024-07-01",
+    "window_end": null
   }]
   ```
   `cover_image_id` is the admin's explicit choice. While it is `null` (or that image has been deleted or
@@ -429,7 +446,8 @@ Runs a draft title and description through the site's hybrid search and returns 
 is written.** The UI pre-selects by threshold locally, lets the admin tick which to keep, then calls 12.3.
 
 - **URL**: `POST /admin/collections/preview`
-- **Request Body (JSON)**: `title` (required), `description`, `limit` (1-500, default 200).
+- **Request Body (JSON)**: `title` (required), `description`, `limit` (1-500, default 200),
+  `window_start`, `window_end` (only search photos taken in that window; blank = open).
 - **Response Example**:
   ```json
   {
@@ -441,25 +459,27 @@ is written.** The UI pre-selects by threshold locally, lets the admin tick which
   In search order. Each `score` is the image's MiniLM cosine to the text (what thresholds compare), so an
   image the search ranks high on keywords or looks alone can sit near the top with a low score: shown,
   but not pre-selected. `metadata.collection_ids` shows which images are already in other collections.
-- **Errors**: `400` blank title.
+- **Errors**: `400` blank title, a date that is not `YYYY-MM-DD`, or a window that ends before it starts.
 
 ### 12.3 Create a Collection
 
 - **URL**: `POST /admin/collections`
 - **Request Body (JSON)**: `title` (required), `description`, `threshold` (0-1, default
-  `COLLECTION_DEFAULT_THRESHOLD`), `image_ids` (the images to put in it, at most 1000).
+  `COLLECTION_DEFAULT_THRESHOLD`), `image_ids` (the images to put in it, at most 1000), `window_start`,
+  `window_end` (stored with the collection; see *Time windows*).
 - **Response**: the collection (see 12.1). If putting the images in fails, the new collection is rolled
   back, so a retry starts clean.
-- **Errors**: `400` blank title, invalid or unknown image id; `422` threshold out of range.
+- **Errors**: `400` blank title, invalid or unknown image id, bad window (as in 12.2); `422` threshold out of range.
 
 ### 12.4 Update a Collection
 
 - **URL**: `PATCH /admin/collections/{id}`
 - **Request Body (JSON)**: any of `title`, `description` (empty clears), `threshold`, `cover_image_id`
-  (empty clears; must be an image in the collection).
+  (empty clears; must be an image in the collection), `window_start`, `window_end` (empty clears that
+  side; a side left out keeps its value, and the resulting window must not end before it starts).
 - Changing the title or description re-embeds the anchor (all three vectors). **Members are left as they are**; run 12.2 again
-  to find more images. A new threshold only affects future matching.
-- **Response**: the collection. **Errors**: `404` unknown id, `400` blank title / bad cover.
+  to find more images. A new threshold or window only affects matching from then on.
+- **Response**: the collection. **Errors**: `404` unknown id, `400` blank title / bad cover / bad window.
 
 ### 12.5 Delete a Collection
 
@@ -501,10 +521,13 @@ For the upload and edit forms: which collections an image with this metadata wou
   as at ingest, so the score equals what ingest would compute.
 - **Response Example**:
   ```json
-  [{ "id": "uuid", "title": "Desert Road Trip", "score": 0.72, "threshold": 0.5, "matched": true },
-   { "id": "uuid", "title": "Winter", "score": 0.08, "threshold": 0.5, "matched": false }]
+  [{ "id": "uuid", "title": "Desert Road Trip", "score": 0.72, "threshold": 0.5, "in_window": true, "matched": true },
+   { "id": "uuid", "title": "Japan 2024", "score": 0.61, "threshold": 0.5, "in_window": false, "matched": false },
+   { "id": "uuid", "title": "Winter", "score": 0.08, "threshold": 0.5, "in_window": true, "matched": false }]
   ```
-  Every collection, best first. Pre-select the `matched` ones; the rest are near misses.
+  Every collection, best first. Pre-select the `matched` ones; the rest are near misses. `in_window` is
+  `false` when the photo's time (from `taken_time`) is outside the collection's window, or it has no time
+  and the collection has a window; such a collection is never `matched`.
 - **Errors**: `400` blank title.
 
 ### 12.9 Rewrite a Collection's Title and Description

@@ -47,6 +47,7 @@ from core.generate_description import description_generator
 from core.rewrite_collection import collection_writer
 from core.autocomplete import autocomplete_manager
 from core import gallery_collections as gc
+from core.taken_at import in_window, parse_day, to_taken_at
 
 async def _none():
     return None
@@ -66,6 +67,13 @@ random_query_manager = RandomQueryManager(redis_client, qdrant_wrapper, embeddin
 async def lifespan(app: FastAPI):
     # Startup: Initialize Qdrant Collection
     await qdrant_wrapper.init_collection()
+    # Images from before `taken_at` existed get theirs (one pass over the payloads)
+    try:
+        filled = await qdrant_wrapper.backfill_taken_at()
+        if filled:
+            print(f"Set taken_at on {filled} image(s).")
+    except Exception as e:
+        print(f"Warning: could not backfill taken_at: {e}")
     # Load the saved autocomplete model (if any) and refresh it from Qdrant in the background
     autocomplete_manager.start(qdrant_wrapper)
     decay_task = asyncio.create_task(_decay_loop())
@@ -353,8 +361,9 @@ async def _ingest_bytes(
         )
 
         # 5. Collections: the admin's explicit choice, or whatever matches the anchors
+        taken_at = to_taken_at(taken_time)
         if collection_ids is None:
-            member_ids = await _auto_collections(text_dense_embedding)
+            member_ids = await _auto_collections(text_dense_embedding, taken_at)
             membership = gc.membership_payload(member_ids, by_admin=False)
         else:
             membership = gc.membership_payload(collection_ids, by_admin=True)
@@ -364,6 +373,7 @@ async def _ingest_bytes(
         payload = {
             "title": title,
             "taken_time": taken_time,
+            "taken_at": taken_at,
             "camera": camera,
             "description": description,
             "preview_url": r2_url_preview,
@@ -678,7 +688,7 @@ async def admin_update_image(
     """
     Edit an image's metadata and re-embed it. The title, description, time and camera
     are all part of the text that gets indexed, so any change re-computes the sparse and
-    `dense-text` vectors; the image vector is untouched.
+    `dense-text` vectors; the image vector is untouched. A new time also updates `taken_at`.
     """
     point = await _require_point(image_id)
     payload = point.payload or {}
@@ -697,6 +707,8 @@ async def admin_update_image(
             updates[field] = value or None
 
     changed = {k: v for k, v in updates.items() if payload.get(k) != v}
+    if "taken_time" in changed:
+        changed["taken_at"] = to_taken_at(changed["taken_time"])
 
     # Explicit membership from the admin; validated before anything is written
     membership: dict = {}
@@ -724,7 +736,9 @@ async def admin_update_image(
         )
         # New text for an image that is in no collection (and has not opted out): match it
         if req.collection_ids is None and gc.is_auto_eligible(payload):
-            matched = await _auto_collections(text_dense_embedding)
+            matched = await _auto_collections(
+                text_dense_embedding, to_taken_at(merged.get("taken_time"))
+            )
             if matched:
                 membership = gc.membership_payload(matched, by_admin=False)
         merged.update(membership)
@@ -837,6 +851,10 @@ class CollectionInfo(BaseModel):
     # Admin-chosen cover; when unset the cover is the image closest to the collection's anchor
     cover_image_id: Optional[str] = None
     cover_preview_url: Optional[str] = None
+    # Only photos taken in this window of whole days (YYYY-MM-DD, inclusive) are offered for the
+    # collection or matched into it. Either side may be open; both None means no window.
+    window_start: Optional[str] = None
+    window_end: Optional[str] = None
 
 
 class CollectionMatch(BaseModel):
@@ -844,6 +862,9 @@ class CollectionMatch(BaseModel):
     title: str
     score: float
     threshold: float
+    # False when the photo was taken outside the collection's window (or has no time and the
+    # collection has a window); such a photo is never `matched`, whatever its score.
+    in_window: bool = True
     matched: bool
 
 
@@ -853,21 +874,28 @@ class CollectionCreateRequest(BaseModel):
     threshold: Optional[float] = Field(None, ge=0, le=1)
     # Images to put in right away (what the admin ticked on the review screen)
     image_ids: List[str] = []
+    window_start: Optional[str] = None
+    window_end: Optional[str] = None
 
 
 class CollectionUpdateRequest(BaseModel):
-    """Partial update; an empty `description` or `cover_image_id` clears it."""
+    """Partial update; an empty `description`, `cover_image_id` or window side clears it."""
 
     title: Optional[str] = None
     description: Optional[str] = None
     threshold: Optional[float] = Field(None, ge=0, le=1)
     cover_image_id: Optional[str] = None
+    window_start: Optional[str] = None
+    window_end: Optional[str] = None
 
 
 class CollectionPreviewRequest(BaseModel):
     title: str
     description: Optional[str] = None
     limit: int = Field(200, ge=1, le=500)
+    # Only search photos taken in this window (see CollectionInfo)
+    window_start: Optional[str] = None
+    window_end: Optional[str] = None
 
 
 class CollectionPreviewResponse(BaseModel):
@@ -939,32 +967,55 @@ async def _require_collections(ids: List[str]):
         )
 
 
-async def _score_collections(text_vector: List[float]) -> List[CollectionMatch]:
-    """Every collection scored against an image's text vector, best first."""
+def _collection_window(payload: dict):
+    return payload.get("window_start"), payload.get("window_end")
+
+
+def _clean_window(start: Optional[str], end: Optional[str]):
+    """A window as (start, end) "YYYY-MM-DD" strings, blank sides open. 400 when malformed
+    or when it ends before it starts."""
+    try:
+        start, end = parse_day(start), parse_day(end)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Dates must be YYYY-MM-DD")
+    if start and end and end < start:
+        raise HTTPException(status_code=400, detail="The window ends before it starts")
+    return start, end
+
+
+async def _score_collections(
+    text_vector: List[float], taken_at: Optional[str]
+) -> List[CollectionMatch]:
+    """
+    Every collection scored against an image's text vector, best first. A collection matches
+    when the score reaches its threshold and the image was taken inside its window, if any.
+    """
     points = await qdrant_wrapper.score_gallery_collections(text_vector)
     matches = []
     for p in points:
         payload = p.payload or {}
         threshold = _collection_threshold(payload)
+        inside = in_window(taken_at, *_collection_window(payload))
         matches.append(
             CollectionMatch(
                 id=str(p.id),
                 title=payload.get("title", ""),
                 score=p.score,
                 threshold=threshold,
-                matched=p.score >= threshold,
+                in_window=inside,
+                matched=inside and p.score >= threshold,
             )
         )
     return matches
 
 
-async def _auto_collections(text_vector: List[float]) -> List[str]:
+async def _auto_collections(text_vector: List[float], taken_at: Optional[str]) -> List[str]:
     """
     Ids of the collections an image matches. Matching is a convenience: if it fails the
     image simply lands in none rather than the upload or edit failing.
     """
     try:
-        return [m.id for m in await _score_collections(text_vector) if m.matched]
+        return [m.id for m in await _score_collections(text_vector, taken_at) if m.matched]
     except Exception as e:
         print(f"Warning: collection matching failed: {e}")
         return []
@@ -1129,6 +1180,8 @@ async def _collection_info(point) -> CollectionInfo:
         image_count=image_count,
         cover_image_id=payload.get("cover_image_id"),
         cover_preview_url=cover.get("preview_url") if cover else None,
+        window_start=payload.get("window_start"),
+        window_end=payload.get("window_end"),
     )
 
 
@@ -1152,6 +1205,7 @@ async def admin_create_collection(
     if not title:
         raise HTTPException(status_code=400, detail="Title cannot be empty")
     description = (req.description or "").strip() or None
+    window_start, window_end = _clean_window(req.window_start, req.window_end)
     image_ids = _clean_image_ids(req.image_ids)
     if image_ids:
         existing = await _fetch_images(image_ids)
@@ -1175,6 +1229,8 @@ async def admin_create_collection(
                 else req.threshold
             ),
             "cover_image_id": None,
+            "window_start": window_start,
+            "window_end": window_end,
             "created_at": time.time(),
         },
     )
@@ -1205,12 +1261,14 @@ async def admin_preview_collection(
     title = req.title.strip()
     if not title:
         raise HTTPException(status_code=400, detail="Title cannot be empty")
+    window = _clean_window(req.window_start, req.window_end)
     vectors = await _embed_collection(title, (req.description or "").strip() or None)
     points = await qdrant_wrapper.search(
         image_vector=vectors["dense-image"],
         text_vector=vectors["dense-text"],
         sparse_vector=vectors["sparse"],
         limit=req.limit,
+        query_filter=qdrant_wrapper.taken_between(*window),
         with_vectors=["dense-text"],
     )
 
@@ -1267,13 +1325,14 @@ async def admin_suggest_collections(
     if not title:
         raise HTTPException(status_code=400, detail="Title cannot be empty")
     # Same text as is stored for the image, so the score equals what ingest would compute
+    taken_time = (req.taken_time or "").strip() or None
     _, _, vector = await _embed_metadata(
         title,
         (req.description or "").strip() or None,
-        (req.taken_time or "").strip() or None,
+        taken_time,
         (req.camera or "").strip() or None,
     )
-    return await _score_collections(vector)
+    return await _score_collections(vector, to_taken_at(taken_time))
 
 
 @app.get("/admin/collections/{collection_id}", response_model=CollectionInfo)
@@ -1291,7 +1350,8 @@ async def admin_update_collection(
 ):
     """
     Edit a collection. Changing its title or description re-embeds the anchor; the members
-    are left as they are (use the review step again to find more images).
+    are left as they are (use the review step again to find more images). A new threshold
+    or window only affects matching from then on.
     """
     point = await _require_collection(collection_id)
     payload = point.payload or {}
@@ -1306,6 +1366,12 @@ async def admin_update_collection(
         updates["description"] = req.description.strip() or None
     if req.threshold is not None:
         updates["threshold"] = req.threshold
+    if req.window_start is not None or req.window_end is not None:
+        # A side left out keeps its value; the result is checked as a whole
+        updates["window_start"], updates["window_end"] = _clean_window(
+            payload.get("window_start") if req.window_start is None else req.window_start,
+            payload.get("window_end") if req.window_end is None else req.window_end,
+        )
     if req.cover_image_id is not None:
         cover_id = req.cover_image_id.strip()
         if cover_id:
