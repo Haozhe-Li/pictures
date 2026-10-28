@@ -507,6 +507,21 @@ For the upload and edit forms: which collections an image with this metadata wou
   Every collection, best first. Pre-select the `matched` ones; the rest are near misses.
 - **Errors**: `400` blank title.
 
+### 12.9 Rewrite a Collection's Title and Description
+
+Suggests a more poetic title and description for a draft collection, from the same LLM and structured
+output as photo captions (`/generate-description`). **Nothing is saved**; the admin keeps, edits or
+discards the text. The prompt keeps every place, date and event the admin wrote, since those words are
+what the collection's photos are found by (12.2), and adds no facts.
+
+- **URL**: `POST /admin/collections/rewrite`
+- **Request Body (JSON)**: `title` (required), `description` (optional; a title alone is fine).
+- **Response Example**:
+  ```json
+  { "title": "Japan, Summer 2024", "description": "Osaka, Kyoto and Tokyo under a long summer light." }
+  ```
+- **Errors**: `400` blank title; `500` the LLM call failed or returned no title.
+
 ## 13. Collections (public)
 
 No authentication. Only collections that have at least one image are listed. `collections_opt_out` is

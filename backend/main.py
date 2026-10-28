@@ -44,6 +44,7 @@ from core.storage import (
 from core.db import QdrantClientWrapper
 from core.utils import process_image_for_embedding, save_as_webp
 from core.generate_description import description_generator
+from core.rewrite_collection import collection_writer
 from core.autocomplete import autocomplete_manager
 from core import gallery_collections as gc
 
@@ -878,6 +879,11 @@ class CollectionPreviewResponse(BaseModel):
     default_threshold: float
 
 
+class CollectionRewriteRequest(BaseModel):
+    title: str
+    description: Optional[str] = None
+
+
 class SuggestRequest(BaseModel):
     title: str
     description: Optional[str] = None
@@ -1225,6 +1231,27 @@ async def admin_preview_collection(
         ],
         default_threshold=settings.DEFAULT_COLLECTION_THRESHOLD,
     )
+
+
+@app.post("/admin/collections/rewrite", response_model=GenerateDescriptionResponse)
+async def admin_rewrite_collection(
+    req: CollectionRewriteRequest, username: str = Depends(verify_credentials)
+):
+    """
+    A more poetic title and description for a draft collection, from the same LLM (and
+    structured output) as photo captions. Nothing is saved; the admin edits or keeps the text.
+    """
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
+    try:
+        result = await collection_writer.rewrite(title, (req.description or "").strip())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Rewrite failed: {e}")
+    title, description = result.title.strip(), result.description.strip()
+    if not title:
+        raise HTTPException(status_code=500, detail="LLM response missing a title")
+    return GenerateDescriptionResponse(title=title, description=description)
 
 
 @app.post("/admin/collections/suggest", response_model=List[CollectionMatch])
