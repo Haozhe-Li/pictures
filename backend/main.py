@@ -75,6 +75,13 @@ async def lifespan(app: FastAPI):
             print(f"Set taken_at on {filled} image(s).")
     except Exception as e:
         print(f"Warning: could not backfill taken_at: {e}")
+    # Collections from before addresses existed get theirs
+    try:
+        filled = await _backfill_collection_slugs()
+        if filled:
+            print(f"Gave {filled} collection(s) an address.")
+    except Exception as e:
+        print(f"Warning: could not backfill collection slugs: {e}")
     # Load the saved autocomplete model (if any) and refresh it from Qdrant in the background
     autocomplete_manager.start(qdrant_wrapper)
     decay_task = asyncio.create_task(_decay_loop())
@@ -849,6 +856,8 @@ async def admin_describe_image(
 
 class CollectionInfo(BaseModel):
     id: str
+    # The collection's address on the site, from its title: /collections/{slug}
+    slug: Optional[str] = None
     title: str
     description: Optional[str] = None
     threshold: float
@@ -1179,6 +1188,7 @@ async def _collection_info(point) -> CollectionInfo:
 
     return CollectionInfo(
         id=collection_id,
+        slug=payload.get("slug"),
         title=payload.get("title", ""),
         description=payload.get("description"),
         threshold=_collection_threshold(payload),
@@ -1222,11 +1232,14 @@ async def admin_create_collection(
 
     vectors = await _embed_collection(title, description)
     collection_id = str(uuid.uuid4())
+    taken = gc.taken_slugs(await qdrant_wrapper.list_gallery_collections())
     await qdrant_wrapper.upsert_gallery_collection(
         collection_id=collection_id,
         vectors=vectors,
         payload={
             "title": title,
+            "slug": gc.unique_slug(gc.slugify(title), taken),
+            "former_slugs": [],
             "description": description,
             "threshold": (
                 settings.DEFAULT_COLLECTION_THRESHOLD
@@ -1389,6 +1402,11 @@ async def admin_update_collection(
         updates["cover_image_id"] = cover_id or None
 
     changed = {k: v for k, v in updates.items() if payload.get(k) != v}
+    if "title" in changed and (
+        not payload.get("slug")
+        or gc.slugify(changed["title"]) != gc.slugify(payload.get("title", ""))
+    ):
+        changed.update(await _readdress(collection_id, payload, changed["title"]))
     if changed:
         vectors = None
         if "title" in changed or "description" in changed:
@@ -1397,6 +1415,43 @@ async def admin_update_collection(
         await qdrant_wrapper.update_gallery_collection(collection_id, changed, vectors=vectors)
         _invalidate_collections_cache()
     return await _collection_info(await _require_collection(collection_id))
+
+
+async def _readdress(collection_id: str, payload: dict, title: str) -> dict:
+    """
+    Payload keys that give a renamed collection the address of its new title. The old one
+    keeps working: it moves to `former_slugs`, and the site redirects it to the new one.
+    """
+    others = gc.taken_slugs(
+        await qdrant_wrapper.list_gallery_collections(), except_id=collection_id
+    )
+    slug = gc.unique_slug(gc.slugify(title), others)
+    former = gc.dedupe([*(payload.get("former_slugs") or []), payload.get("slug")])
+    return {"slug": slug, "former_slugs": [s for s in former if s != slug]}
+
+
+async def _backfill_collection_slugs() -> int:
+    """
+    Give collections from before addresses existed theirs. The oldest go first, so when two
+    titles make the same slug, the older collection gets it without a suffix.
+    """
+    points = await qdrant_wrapper.list_gallery_collections()
+    points.sort(key=lambda p: (p.payload or {}).get("created_at", 0))
+    taken = gc.taken_slugs(points)
+    filled = 0
+    for p in points:
+        payload = p.payload or {}
+        if payload.get("slug"):
+            continue
+        slug = gc.unique_slug(gc.slugify(payload.get("title", "")), taken)
+        taken.add(slug)
+        await qdrant_wrapper.update_gallery_collection(
+            str(p.id), {"slug": slug, "former_slugs": payload.get("former_slugs") or []}
+        )
+        filled += 1
+    if filled:
+        _invalidate_collections_cache()
+    return filled
 
 
 @app.delete("/admin/collections/{collection_id}")
@@ -1475,6 +1530,7 @@ async def admin_change_membership(
 
 class PublicCollection(BaseModel):
     id: str
+    slug: Optional[str] = None
     title: str
     description: Optional[str] = None
     image_count: int
@@ -1502,6 +1558,7 @@ def _invalidate_collections_cache():
 def _to_public_collection(info: CollectionInfo) -> PublicCollection:
     return PublicCollection(
         id=info.id,
+        slug=info.slug,
         title=info.title,
         description=info.description,
         image_count=info.image_count,
@@ -1529,23 +1586,41 @@ async def list_collections():
     return items
 
 
-@app.get("/collections/{collection_id}", response_model=PublicCollection)
-async def get_collection(collection_id: str):
-    return _to_public_collection(await _collection_info(await _require_collection(collection_id)))
+async def _find_collection(ref: str):
+    """A collection by its id, its address (slug), or an address it had before a rename."""
+    if gc.is_uuid(ref):
+        return await _require_collection(ref)
+    point = await qdrant_wrapper.find_gallery_collection_by_slug(ref)
+    if not point and ref != ref.lower():
+        # Slugs are lower case; /collections/Formula-1 means formula-1
+        point = await qdrant_wrapper.find_gallery_collection_by_slug(ref.lower())
+    if not point:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    return point
 
 
-@app.get("/collections/{collection_id}/images", response_model=CollectionImages)
+@app.get("/collections/{ref}", response_model=PublicCollection)
+async def get_collection(ref: str):
+    """
+    A collection by its id or slug. A slug it had before a rename finds it too; the response
+    carries the current `slug`, so the site can redirect to it.
+    """
+    return _to_public_collection(await _collection_info(await _find_collection(ref)))
+
+
+@app.get("/collections/{ref}/images", response_model=CollectionImages)
 async def get_collection_images(
-    collection_id: str,
+    ref: str,
     limit: int = Query(40, ge=1, le=100),
     cursor: Optional[str] = None,
 ):
     """
-    The images of a collection, most representative first: in the order the site's search
-    ranks them for the collection's text. Pass the returned `next_cursor` to get the following
-    page.
+    The images of a collection (by id or slug), most representative first: in the order the
+    site's search ranks them for the collection's text. Pass the returned `next_cursor` to get
+    the following page.
     """
-    point = await _require_collection(collection_id)
+    point = await _find_collection(ref)
+    collection_id = str(point.id)
     offset = _offset_cursor(cursor)
     total = await qdrant_wrapper.count(qdrant_wrapper.collection_filter(collection_id))
     points = await _rank_members(point, limit, offset, total) if offset < total else []

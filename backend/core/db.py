@@ -483,6 +483,22 @@ class QdrantClientWrapper:
         )
         return points[0] if points else None
 
+    async def find_gallery_collection_by_slug(self, slug: str):
+        """The collection at this address, else the one that had it before a rename; with its vectors."""
+        for key in ("slug", "former_slugs"):
+            points, _ = await self.client.scroll(
+                collection_name=settings.GALLERY_COLLECTIONS_NAME,
+                scroll_filter=models.Filter(
+                    must=[models.FieldCondition(key=key, match=models.MatchValue(value=slug))]
+                ),
+                limit=1,
+                with_payload=True,
+                with_vectors=True,
+            )
+            if points:
+                return points[0]
+        return None
+
     async def list_gallery_collections(self):
         """Every collection (there are only ever a handful), with its vectors."""
         points, offset = [], None

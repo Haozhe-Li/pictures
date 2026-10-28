@@ -424,6 +424,14 @@ leaves `taken_at` empty. EXIF times have no time zone, so they are stored as if 
 taken inside it, and automatic assignment only puts a photo in the collection when it was taken inside it
 (a photo without `taken_at` is outside every window). Members already in the collection are not affected.
 
+**Addresses.** Each collection has a `slug` made from its title, its address on the site
+(`/collections/formula-1`): lower case, words joined by hyphens, accents dropped (`Café` → `cafe`), letters
+of other scripts kept (`四川之夏`), at most 60 characters. When another collection already answers to that
+slug, a 4-character random suffix is added (`formula-1-k3x9`). A new title that makes a different slug gives
+the collection a new one; the old one moves to `former_slugs` and keeps finding the collection (13.2), so
+shared links do not break. No two collections ever answer to the same slug, current or former; deleting a
+collection frees its slugs. On startup, collections without a slug get one, oldest first.
+
 **Upgrading from `gallery_collections`** (MiniLM + BM25 only): on first startup the collections are
 copied into `gallery_collections_v2`; the old store is left in place and can be deleted afterwards. Each
 copied collection gets its CLIP vector the first time it is needed (if the embedding service is down then,
@@ -436,6 +444,7 @@ it is searched on its text alone and the CLIP vector is added on a later request
   ```json
   [{
     "id": "uuid-string",
+    "slug": "desert-road-trip",
     "title": "Desert Road Trip",
     "description": "Cacti, boneyards and long straight roads.",
     "threshold": 0.5,
@@ -488,7 +497,8 @@ is written.** The UI pre-selects by threshold locally, lets the admin tick which
 - **Request Body (JSON)**: any of `title`, `description` (empty clears), `threshold`, `cover_image_id`
   (empty clears; must be an image in the collection), `window_start`, `window_end` (empty clears that
   side; a side left out keeps its value, and the resulting window must not end before it starts).
-- Changing the title or description re-embeds the anchor (all three vectors). **Members are left as they are**; run 12.2 again
+- Changing the title or description re-embeds the anchor (all three vectors). A title that makes a
+  different slug moves the collection to a new address (see *Addresses* in 12). **Members are left as they are**; run 12.2 again
   to find more images. A new threshold or window only affects matching from then on.
 - **Response**: the collection. **Errors**: `404` unknown id, `400` blank title / bad cover / bad window.
 
@@ -571,6 +581,7 @@ same instance (membership, edits, deletes, ingest into a collection).
   ```json
   [{
     "id": "uuid-string",
+    "slug": "racing",
     "title": "Racing",
     "description": "Grandstands, pit lanes and long straights",
     "image_count": 48,
@@ -582,13 +593,15 @@ same instance (membership, edits, deletes, ingest into a collection).
 
 ### 13.2 Get a Collection
 
-- **URL**: `GET /collections/{collection_id}`
+- **URL**: `GET /collections/{ref}`, where `ref` is the collection's id, its slug, or a slug it had before a
+  rename (percent-encode slugs with non-ASCII letters).
 - **Response**: one collection in the shape above (an empty collection is returned too, with `image_count` 0).
-- **Errors**: `404` unknown id.
+  Its `slug` is the current one: when `ref` is something else, the site redirects there.
+- **Errors**: `404` nothing answers to `ref`.
 
 ### 13.3 List a Collection's Images
 
-- **URL**: `GET /collections/{collection_id}/images?limit=40&cursor=...`
+- **URL**: `GET /collections/{ref}/images?limit=40&cursor=...` (`ref` as in 13.2)
 - **Query Parameters**: `limit` (1-100, default 40), `cursor` (the previous response's `next_cursor`).
 - **Response Example**:
   ```json
@@ -601,4 +614,4 @@ same instance (membership, edits, deletes, ingest into a collection).
   In the order the site's search ranks the members for the collection's text, so the most representative
   images come first (`score` is the fused search score, only meaningful for ordering). `next_cursor` is
   `null` on the last page.
-- **Errors**: `404` unknown id, `400` invalid cursor.
+- **Errors**: `404` nothing answers to `ref`, `400` invalid cursor.
