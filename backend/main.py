@@ -304,7 +304,7 @@ async def _ingest_bytes(
         file_uuid = uuid.uuid4()
 
         # Generate filenames for R2 (WebP)
-        # Preview: Quality 10, Original: Quality 90
+        # Preview: quality 5, long edge 1200; Original: quality 90, long edge 3000
         storage_filename_preview = f"{file_uuid}_preview.webp"
         storage_filename_original = f"{file_uuid}_original.webp"
 
@@ -312,13 +312,13 @@ async def _ingest_bytes(
         temp_filename_preview = f"/tmp/{storage_filename_preview}"
         temp_filename_original = f"/tmp/{storage_filename_original}"
 
-        # 1.1 Save Preview (Quality 10) with lower resolution
+        # 1.1 Save Preview (Quality 5) with lower resolution
         await run_in_threadpool(
             save_as_webp, file_bytes, temp_filename_preview, 5, max_size=1200
         )
 
         # 1.2 Save Original (Quality 90)
-        await run_in_threadpool(save_as_webp, file_bytes, temp_filename_original, 60)
+        await run_in_threadpool(save_as_webp, file_bytes, temp_filename_original, 90)
 
         # Process image for embedding (Resize & Compress)
         # We generally deliver the compressed version to embedding model to save bandwidth and meet limits.
