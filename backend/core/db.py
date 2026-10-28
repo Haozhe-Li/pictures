@@ -255,6 +255,43 @@ class QdrantClientWrapper:
         )
         return points, next_offset
 
+    async def scroll_by_taken_at(
+        self,
+        limit: int,
+        newest_first: bool,
+        start_from: Optional[str] = None,
+        skip: Optional[List[str]] = None,
+    ):
+        """
+        Images that have a `taken_at`, in time order from `start_from` (inclusive) on, leaving out
+        `skip`. Qdrant does not page an ordered scroll, so callers carry the position themselves.
+        """
+        must_not = [self._no_taken_at()]
+        if skip:
+            must_not.append(models.HasIdCondition(has_id=skip))
+        points, _ = await self.client.scroll(
+            collection_name=settings.COLLECTION_NAME,
+            scroll_filter=models.Filter(must_not=must_not),
+            order_by=models.OrderBy(
+                key="taken_at",
+                direction=models.Direction.DESC if newest_first else models.Direction.ASC,
+                start_from=start_from,
+            ),
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return points
+
+    @staticmethod
+    def _no_taken_at() -> models.IsEmptyCondition:
+        return models.IsEmptyCondition(is_empty=models.PayloadField(key="taken_at"))
+
+    @classmethod
+    def undated(cls) -> models.Filter:
+        """Images with no `taken_at` (no time, or one that could not be read)."""
+        return models.Filter(must=[cls._no_taken_at()])
+
     async def count(self, count_filter: Optional[models.Filter] = None) -> int:
         """Number of points in the collection (matching `count_filter`, if given)."""
         result = await self.client.count(

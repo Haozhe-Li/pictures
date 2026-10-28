@@ -1,11 +1,12 @@
 import asyncio
+import base64
 import math
 import uuid
 import os
 import re
 import random
 import time
-from typing import Optional, List
+from typing import Literal, Optional, List
 from contextlib import asynccontextmanager
 
 from fastapi import (
@@ -213,6 +214,10 @@ class GalleryResponse(BaseModel):
 class FeedRequest(BaseModel):
     limit: int = 20
     seen_ids: List[str] = []
+    # "default" is the recommended feed; "newest" and "oldest" go by the time each photo was taken
+    order: Literal["default", "newest", "oldest"] = "default"
+    # Time orders only: the `next_cursor` of the previous page
+    cursor: Optional[str] = None
 
 
 class GenerateDescriptionResponse(BaseModel):
@@ -1672,11 +1677,92 @@ async def similar_to_image(request: SimilarToRequest):
 EXPLORE_GRADUATION_IMPRESSIONS = 10
 
 
+def _feed_item(point) -> SearchResult:
+    return SearchResult(
+        id=str(point.id),
+        preview_url=point.payload.get("preview_url", ""),
+        original_url=point.payload.get("original_url", ""),
+        metadata=_public_metadata(point.payload),
+        score=1.0,  # Default score for browsing
+    )
+
+
+def _encode_cursor(state: dict) -> str:
+    return base64.urlsafe_b64encode(json.dumps(state, separators=(",", ":")).encode()).decode()
+
+
+def _timeline_cursor(cursor: Optional[str]) -> dict:
+    """
+    Where a time-ordered page starts: at a time, leaving out the photos already shown at it,
+    or, once every dated photo has been shown, at an offset among the undated ones.
+    """
+    if not cursor:
+        return {"at": None, "skip": []}
+    try:
+        state = json.loads(base64.urlsafe_b64decode(cursor.encode()))
+        if "undated" in state:
+            offset = state["undated"]
+            if offset is not None:
+                uuid.UUID(offset)
+            return {"undated": offset}
+        at, skip = state["at"], state["skip"]
+        if to_taken_at(at) != at or not all(isinstance(i, str) for i in skip):
+            raise ValueError
+        return {"at": at, "skip": skip}
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+
+
+async def _timeline_page(newest_first: bool, limit: int, cursor: Optional[str]) -> GalleryResponse:
+    """
+    Every photo by the time it was taken; the ones with no time come last in both orders.
+    Several photos can share a time (a day given without the hour), so the cursor keeps the
+    ones already shown at the last time, and the next page starts at that time without them.
+    """
+    limit = max(1, min(limit, 100))
+    state = _timeline_cursor(cursor)
+    points = []
+    if "undated" not in state:
+        points = await qdrant_wrapper.scroll_by_taken_at(
+            limit, newest_first, start_from=state["at"], skip=state["skip"]
+        )
+        if len(points) == limit:
+            last = points[-1].payload.get("taken_at")
+            skip = [str(p.id) for p in points if p.payload.get("taken_at") == last]
+            if last == state["at"]:
+                skip += state["skip"]
+            return GalleryResponse(
+                items=[_feed_item(p) for p in points],
+                next_cursor=_encode_cursor({"at": last, "skip": skip}),
+            )
+        state = {"undated": None}
+
+    undated, offset = await qdrant_wrapper.scroll(
+        limit=limit - len(points),
+        offset=state["undated"],
+        scroll_filter=qdrant_wrapper.undated(),
+    )
+    points += undated
+    return GalleryResponse(
+        items=[_feed_item(p) for p in points],
+        next_cursor=_encode_cursor({"undated": str(offset)}) if offset is not None else None,
+    )
+
+
 @app.post("/gallery", response_model=GalleryResponse)
 async def get_gallery(request: FeedRequest):
     """
-    Get dynamic waterfall images using Redis Waterfall logic.
+    Get dynamic waterfall images using Redis Waterfall logic, or, with a time `order`,
+    every image by the time it was taken (paged with `cursor`; `seen_ids` is not used).
     """
+    if request.order != "default":
+        try:
+            return await _timeline_page(request.order == "newest", request.limit, request.cursor)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
     try:
         limit = request.limit
         seen_set = set(request.seen_ids)
@@ -1722,19 +1808,7 @@ async def get_gallery(request: FeedRequest):
 
         points_map = {str(p.id): p for p in points}
 
-        items = []
-        for pid in final_ids:
-            if pid in points_map:
-                point = points_map[pid]
-                items.append(
-                    SearchResult(
-                        id=str(point.id),
-                        preview_url=point.payload.get("preview_url", ""),
-                        original_url=point.payload.get("original_url", ""),
-                        metadata=_public_metadata(point.payload),
-                        score=1.0,  # Default score for browsing
-                    )
-                )
+        items = [_feed_item(points_map[pid]) for pid in final_ids if pid in points_map]
 
         # 5. Async trigger impressions for explore images
         # For simplicity and speed in Redis, we await them directly, it's very fast

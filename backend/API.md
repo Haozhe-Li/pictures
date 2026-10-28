@@ -4,12 +4,22 @@ Base URL: http://localhost:8000 (or deployed domain)
 
 ## 1. Get Gallery (Browse)
 
-Get all uploaded images with pagination support.
+The home page feed, in one of three orders.
 
-- **URL**: `GET /gallery`
-- **Query Parameters**:
+- **URL**: `POST /gallery`
+- **Body**:
   - `limit` (int, optional): Number of items per page. Default: 20.
-  - `cursor` (string, optional): Token for fetching the next page.
+  - `order` (string, optional): `default`, `newest` or `oldest`. Default: `default`.
+    - `default`: the recommended feed, a fresh mix on each call: about 90% from the hot pool (images people
+      open and share most) and 10% from the explore pool (images shown least), shuffled. Pass the ids
+      already shown in `seen_ids` to get more; `next_cursor` is always null. Explore images shown count
+      as impressions.
+    - `newest` / `oldest`: every image by `taken_at` (see *Photo times* in 12), latest or earliest first.
+      Images with no `taken_at` come after the dated ones in both orders. Pass the previous page's
+      `next_cursor` as `cursor` to get the next page; it is null on the last page. `seen_ids` is not used,
+      no impressions are counted, and `limit` is clamped to 1–100.
+  - `seen_ids` (string[], optional, `default` only): ids already shown.
+  - `cursor` (string, optional, `newest` / `oldest` only): opaque; `400` if it cannot be read.
 - **Response Example**:
   ```json
   {
@@ -29,9 +39,10 @@ Get all uploaded images with pagination support.
         }
       }
     ],
-    "next_cursor": "offset_token_for_next_page"
+    "next_cursor": "eyJhdCI6IjIwMjMtMDctMDFUMDA6MDA6MDBaIiwic2tpcCI6W119"
   }
   ```
+  Each item also has an `id`; `metadata` is the public subset of the payload.
 
 ## 2. Search Images (Semantic Search)
 
