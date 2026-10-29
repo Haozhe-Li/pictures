@@ -197,21 +197,26 @@ clean up uploads that were neither ingested nor discarded.
 
 ## 5. Generate Random Query
 
-Get a random search query that is guaranteed to be grounded in the gallery.
+Get random search queries that are guaranteed to be grounded in the gallery (the site shows a
+few as suggestions under its search box).
 
 Queries come from a Redis queue (`random_query:queue`). A refill samples random images,
 has a small LLM rewrite each title + description into a short search query, and warms the
 query's embeddings into the embedding cache so the follow-up `/search` is fast. Each call
-pops one query; when 5 or fewer remain, 10 more are added in the background. If the queue is
-empty or Redis/LLM fails, a query from a small static list is returned instead.
+pops `count` different queries; when 5 or fewer remain, 10 more are added in the background.
+If the queue is empty or Redis/LLM fails, queries from a small static list make up the rest.
 
 - **URL**: `GET /generate-random-query`
-- **Response Example**:
+- **Query Parameters**:
+  - `count`: (int, Optional) How many queries, 1-5. Default: `1`.
+- **Response Example** (`?count=2`):
   ```json
   {
-    "query": "daylight lingers on wisconsin autumn"
+    "query": "daylight lingers on wisconsin autumn",
+    "queries": ["daylight lingers on wisconsin autumn", "misty hills above kyoto"]
   }
   ```
+  `query` is the first of `queries`, for clients that ask for one.
 
 ## 6. Generate Description (Auto Title & Description)
 

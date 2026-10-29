@@ -2001,15 +2001,16 @@ async def interact_image(request: InteractRequest):
 
 
 @app.get("/generate-random-query")
-async def generate_random_query_endpoint():
+async def generate_random_query_endpoint(count: int = Query(1, ge=1, le=5)):
     """
-    Pop a random search query from the Redis queue. Queries are LLM-rewritten from the
-    title + description of random gallery images, with their embeddings pre-warmed.
-    Falls back to a static list if the queue is empty or unavailable.
+    Pop `count` different random search queries from the Redis queue (the site shows a few
+    as suggestions under its search box). Queries are LLM-rewritten from the title +
+    description of random gallery images, with their embeddings pre-warmed. Falls back to
+    a static list if the queue is empty or unavailable. `query` is the first of `queries`.
     """
     try:
-        query = await random_query_manager.next_query()
-        return {"query": query}
+        queries = await random_query_manager.next_queries(count)
+        return {"query": queries[0], "queries": queries}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

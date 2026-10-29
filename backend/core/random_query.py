@@ -48,20 +48,18 @@ class QueryBatch(BaseModel):
 _query_writer = chat_model.with_structured_output(QueryBatch)
 
 
-async def generate_random_query() -> str:
-    """Static fallback, used whenever the queue is empty or unavailable."""
-    choices = [
-        "A serene landscape with mountains and a river",
-        "A bustling city street at night with neon lights",
-        "A close-up of a colorful butterfly on a flower",
-        "A futuristic city skyline with flying cars",
-        "A cozy cabin in the woods during autumn",
-        "A majestic lion resting in the savannah",
-        "A vibrant coral reef teeming with marine life",
-        "A snowy mountain peak under a clear blue sky",
-        "A group of friends enjoying a picnic in the park",
-    ]
-    return random.choice(choices)
+# Static fallback, used whenever the queue is empty or unavailable.
+FALLBACK_QUERIES = [
+    "A serene landscape with mountains and a river",
+    "A bustling city street at night with neon lights",
+    "A close-up of a colorful butterfly on a flower",
+    "A futuristic city skyline with flying cars",
+    "A cozy cabin in the woods during autumn",
+    "A majestic lion resting in the savannah",
+    "A vibrant coral reef teeming with marine life",
+    "A snowy mountain peak under a clear blue sky",
+    "A group of friends enjoying a picnic in the park",
+]
 
 
 class RandomQueryManager:
@@ -70,7 +68,7 @@ class RandomQueryManager:
 
     A refill samples random images, has a small LLM rewrite each title + description
     into a search-style query, warms the query's embeddings, and appends it to a Redis
-    queue. A click pops one query off the front; when the queue runs low a background
+    queue. A request pops queries off the front; when the queue runs low a background
     refill tops it up. Anything going wrong falls back to the static list.
     """
 
@@ -82,21 +80,35 @@ class RandomQueryManager:
 
     # --- Serving ---
 
-    async def next_query(self) -> str:
-        """Pop the next query, or fall back to the static list. Never raises."""
+    async def next_queries(self, count: int = 1) -> List[str]:
+        """
+        Pop `count` different queries off the queue; the static list makes up whatever the
+        queue cannot give. Never raises.
+        """
+        queries: List[str] = []
+        seen: set = set()
         try:
-            raw = await self.redis.lpop(QUEUE_KEY)
-            remaining = await self.redis.llen(QUEUE_KEY)
-            if remaining <= REFILL_THRESHOLD:
-                self.schedule_refill()
-            if raw:
+            # Two images can be rewritten into the same query: skip repeats, within reason
+            for _ in range(count * 2):
+                if len(queries) == count:
+                    break
+                raw = await self.redis.lpop(QUEUE_KEY)
+                if not raw:
+                    break
                 query = json.loads(raw).get("query")
-                if query:
-                    return query
-            print("Random query queue empty, using static fallback")
+                if query and query.lower() not in seen:
+                    queries.append(query)
+                    seen.add(query.lower())
+            if await self.redis.llen(QUEUE_KEY) <= REFILL_THRESHOLD:
+                self.schedule_refill()
         except Exception as e:
             print(f"Random query queue error, using static fallback: {e}")
-        return await generate_random_query()
+
+        if len(queries) < count:
+            print(f"Random query queue short by {count - len(queries)}, using static fallback")
+            spare = [q for q in FALLBACK_QUERIES if q.lower() not in seen]
+            queries += random.sample(spare, min(count - len(queries), len(spare)))
+        return queries
 
     def schedule_refill(self) -> None:
         """Start a background refill (no-op while another one holds the lock)."""
