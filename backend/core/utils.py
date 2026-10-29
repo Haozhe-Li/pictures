@@ -1,5 +1,6 @@
 import base64
 import io
+from typing import Union
 from PIL import Image
 
 
@@ -36,16 +37,16 @@ def process_image_for_embedding(file_bytes: bytes, max_size: int = 1024) -> str:
 
 
 def save_as_webp(
-    file_bytes: bytes,
+    source: Union[bytes, Image.Image],
     output_path: str,
     quality: int = 50,
     max_size: int = 3000,
 ) -> None:
     """
-    Compresses image to WebP and saves to the specified path.
-    Optionally downscales to max_size (longer edge).
+    Compresses an image (file bytes, or an image already open) to WebP and saves it to the
+    specified path. Optionally downscales to max_size (longer edge); an open image is left as it was.
     """
-    image = Image.open(io.BytesIO(file_bytes))
+    image = Image.open(io.BytesIO(source)) if isinstance(source, bytes) else source.copy()
 
     # Resize if dimensions exceed max_size (maintaining aspect ratio)
     if max_size and max(image.size) > max_size:

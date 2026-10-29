@@ -126,6 +126,7 @@ Upload an image, generate embeddings (Dense + Sparse), and store metadata.
   - `camera`: (String, Optional) Camera model.
   - `allow_duplicate`: (Boolean, Optional, default `false`) Ingest even if the image looks like one
     already in the gallery (see *Duplicates* below).
+  - `watermark`: (Boolean, Optional, default `false`) Add an invisible watermark (see *Watermarks* below).
 - **Response Example**:
   ```json
   {
@@ -133,9 +134,11 @@ Upload an image, generate embeddings (Dense + Sparse), and store metadata.
     "id": "uuid-string",
     "preview_url": "https://cdn.haozheli.com/uuid_preview.webp",
     "original_url": "https://cdn.haozheli.com/uuid_original.webp",
-    "metadata_used_for_sparse": "Title Description ..."
+    "metadata_used_for_sparse": "Title Description ...",
+    "watermark": { "id": "0f3a9c2e81b4d657", "verified": true }
   }
   ```
+  `watermark` is `null` when none was asked for.
 
 **Duplicates.** The image's CLIP vector is computed first and compared with every image's
 `dense-image` vector. If any scores at least `DUPLICATE_THRESHOLD` (cosine, default 0.95), nothing is
@@ -153,6 +156,22 @@ a re-export a little less, but neighbouring burst shots can come close too, so t
 refuses for good. To choose the threshold (and find photos already uploaded twice), run
 `python -m scripts.find_duplicates` from `backend/`: it lists how close each image's nearest other
 image is and the closest pairs.
+
+**Watermarks.** With `watermark`, the photo gets an invisible [TrustMark](https://github.com/adobe/trustmark)
+watermark (Adobe's, variant Q, run on ONNX Runtime; vendored in `core/watermark`) carrying a new random
+61-bit id. The order is: duplicate check, scale to the published size (long edge 3000), watermark, then
+the preview and original WebP files are made from the watermarked photo. The id is then read back from
+the published original, and the image record gets `watermark_id` (16 hex digits), `watermark_model`
+(`"Q"`) and `watermark_verified` (whether it read back; a photo whose mark does not read is still
+published). Public responses leave these out. If the watermark cannot be added (the models fail to
+load), nothing is published and the response is `503`; the staged object of `/ingest/staged` is kept for
+a retry. 14 finds a watermark again.
+
+The models (`encoder_Q.onnx`, 17 MB, and `decoder_Q.onnx`, 47 MB) are fetched into
+`WATERMARK_MODEL_DIR` (default `backend/models/trustmark`) by `python -m core.watermark`, which the
+Docker build runs; elsewhere they are fetched on first use. They are loaded into memory only when a
+photo is watermarked or checked, one image is processed at a time, and they are dropped again after
+`WATERMARK_IDLE_SECONDS` (default 600) without use. `WATERMARK_THREADS` (default 2) caps the CPU threads.
 
 ### 4.1 Browser-direct upload (presign + ingest staged)
 
@@ -178,7 +197,7 @@ Returns one entry per file; `PUT` the raw file to `upload_url` with the same `Co
 
 ```json
 { "key": "staging/<uuid>.jpg", "title": "...", "description": null, "taken_time": null, "camera": null,
-  "collection_ids": ["<collection uuid>"], "allow_duplicate": false }
+  "collection_ids": ["<collection uuid>"], "allow_duplicate": false, "watermark": false }
 ```
 
 `collection_ids` is optional: a list puts the image in exactly those collections (`[]` = none, and
@@ -371,7 +390,7 @@ Stable, paginated listing of every image (`/gallery` is a random feed and cannot
 
 - **URL**: `GET /admin/images/{id}`
 - **Response**: the image in the same shape as an item of `/admin/images`, with the whole payload as
-  `metadata` (including `collections_opt_out`, which public responses leave out).
+  `metadata` (including `collections_opt_out` and the `watermark_*` fields, which public responses leave out).
 - **Errors**: `404` unknown id.
 
 ### 11.2 Update Metadata
@@ -652,3 +671,24 @@ same instance (membership, edits, deletes, ingest into a collection).
   images come first (`score` is the fused search score, only meaningful for ordering). `next_cursor` is
   `null` on the last page.
 - **Errors**: `404` nothing answers to `ref`, `400` invalid cursor.
+
+## 14. Admin: Check a Watermark
+
+Looks for a watermark of 4 in any image. **Requires Authentication (Basic Auth).**
+
+- **URL**: `POST /admin/watermark/detect`
+- **Request Body (JSON)**: `{ "key": "staging/<uuid>.jpg" }`, an image uploaded with `/upload/presign`
+  (see 4.1). The staged object is deleted whatever the outcome.
+- **Response Example**:
+  ```json
+  { "found": true, "watermark_id": "0f3a9c2e81b4d657",
+    "image": { "id": "uuid", "preview_url": "...", "original_url": "...", "score": 1.0, "metadata": { } } }
+  ```
+  The image is read as it is and turned by 90, 180 and 270 degrees. `image` is the photo whose watermark
+  carries that id, with its whole payload; `null` when no photo in the gallery does (a deleted photo, or a
+  TrustMark watermark from elsewhere). `{ "found": false }` when there is none. Only marks with TrustMark's
+  BCH_5 schema (the one written here) count, because random bits now and then pass as one of its weaker
+  schemas. A watermark survives the WebP files, JPEG re-saves, downscaling and small crops; heavy crops
+  and strong edits remove it.
+- **Errors**: `400` invalid key or not an image, `404` no such staged object, `503` the models could not
+  be loaded.

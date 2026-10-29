@@ -11,4 +11,8 @@ ENV PORT 8080
 
 RUN pip install --no-cache-dir -r requirements.txt
 
+# TrustMark's ONNX models (core/watermark), fetched once here so watermarking never waits on a
+# download; they are loaded into memory only while a photo is watermarked or checked.
+RUN python -m core.watermark
+
 CMD exec uvicorn main:app --host 0.0.0.0 --port ${PORT}

@@ -249,3 +249,6 @@ next-env.d.ts
 .DS_Store
 # Autocomplete model, built on the deployed server (see backend/core/autocomplete.py)
 backend/data/
+
+# TrustMark models, fetched by `python -m core.watermark` (the Docker build runs it)
+backend/models/trustmark/

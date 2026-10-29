@@ -89,6 +89,16 @@ class QdrantClientWrapper:
         except Exception as e:
             print(f"Warning: could not ensure payload index on collection_ids: {e}")
 
+        # The watermark check looks photos up by the id their watermark carries
+        try:
+            await self.client.create_payload_index(
+                collection_name=settings.COLLECTION_NAME,
+                field_name="watermark_id",
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
+        except Exception as e:
+            print(f"Warning: could not ensure payload index on watermark_id: {e}")
+
         await self._init_gallery_collections()
 
     async def _init_gallery_collections(self):
@@ -569,6 +579,19 @@ class QdrantClientWrapper:
             with_vectors=True,
         )
         return res.points[0] if res.points else None
+
+    async def find_point_by_watermark(self, watermark_id: str):
+        """The image whose watermark carries `watermark_id` (see core/watermark), payload only."""
+        points, _ = await self.client.scroll(
+            collection_name=settings.COLLECTION_NAME,
+            scroll_filter=models.Filter(
+                must=[models.FieldCondition(key="watermark_id", match=models.MatchValue(value=watermark_id))]
+            ),
+            limit=1,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return points[0] if points else None
 
     async def get_point(self, point_id: str):
         """

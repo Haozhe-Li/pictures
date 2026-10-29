@@ -49,6 +49,14 @@ from core.rewrite_collection import collection_writer
 from core.autocomplete import autocomplete_manager
 from core import gallery_collections as gc
 from core.taken_at import in_window, parse_day, to_taken_at
+from core.watermark import (
+    WatermarkUnavailable,
+    format_watermark_id,
+    new_watermark_id,
+    read_photo,
+    watermark_photo,
+)
+from PIL import UnidentifiedImageError
 
 async def _none():
     return None
@@ -110,9 +118,14 @@ app.add_middleware(
 )
 
 
+# Bookkeeping the public site has no use for. The watermark id stays with the admin, whose watermark
+# check is what turns it back into a photo.
+PRIVATE_FIELDS = {"collections_opt_out", "watermark_id", "watermark_model", "watermark_verified"}
+
+
 def _public_metadata(payload: dict) -> dict:
     """An image's payload minus the bookkeeping the site has no use for."""
-    return {k: v for k, v in (payload or {}).items() if k != "collections_opt_out"}
+    return {k: v for k, v in (payload or {}).items() if k not in PRIVATE_FIELDS}
 
 
 @app.get("/autocomplete")
@@ -300,6 +313,15 @@ class DuplicateMatch(BaseModel):
     score: float
 
 
+# Long edge of the published original (`<uuid>_original.webp`)
+ORIGINAL_MAX_SIZE = 3000
+
+
+def _read_file(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
 async def _duplicate_matches(image_vector: List[float]) -> List[DuplicateMatch]:
     """Up to three images in the gallery that look like the same photo, closest first."""
     points = await qdrant_wrapper.nearest_images(
@@ -325,10 +347,16 @@ async def _ingest_bytes(
     description: Optional[str],
     collection_ids: Optional[List[str]] = None,
     allow_duplicate: bool = False,
+    watermark: bool = False,
 ):
     """
     Shared ingest pipeline (see /ingest for the steps). Takes the raw image bytes
     so it works for both multipart uploads and files pulled from the R2 staging area.
+
+    With `watermark`, the photo is scaled to its published size and gets an invisible TrustMark
+    watermark carrying a new id before its WebP files are made from it; the id is read back from the
+    published original to check it survived, and both go on the record. If the watermark cannot be
+    added the ingest fails (503) rather than publishing the photo without it.
 
     `collection_ids` is the admin's explicit choice of collections ([] = none, and it sticks);
     None lets the server match the new image against the collections' anchors.
@@ -380,13 +408,39 @@ async def _ingest_bytes(
         temp_filename_preview = f"/tmp/{storage_filename_preview}"
         temp_filename_original = f"/tmp/{storage_filename_original}"
 
-        # 3.1 Save Preview (Quality 5) with lower resolution
+        # 3.1 Watermark: both WebP files are made from the watermarked photo
+        source = file_bytes
+        watermark_id = new_watermark_id() if watermark else None
+        if watermark_id is not None:
+            try:
+                source = await run_in_threadpool(
+                    watermark_photo, file_bytes, watermark_id, ORIGINAL_MAX_SIZE
+                )
+            except WatermarkUnavailable as e:
+                raise HTTPException(status_code=503, detail=f"Watermark unavailable: {e}")
+
+        # 3.2 Save Preview (Quality 5) with lower resolution
         await run_in_threadpool(
-            save_as_webp, file_bytes, temp_filename_preview, 5, max_size=1200
+            save_as_webp, source, temp_filename_preview, 5, max_size=1200
         )
 
-        # 3.2 Save Original (Quality 90)
-        await run_in_threadpool(save_as_webp, file_bytes, temp_filename_original, 90)
+        # 3.3 Save Original (Quality 90)
+        await run_in_threadpool(
+            save_as_webp, source, temp_filename_original, 90, max_size=ORIGINAL_MAX_SIZE
+        )
+        del source
+
+        # 3.4 The watermark has to survive the WebP compression: read it back from the original.
+        #     A photo whose mark does not read still goes up, flagged.
+        watermark_verified = False
+        if watermark_id is not None:
+            try:
+                published = await run_in_threadpool(_read_file, temp_filename_original)
+                watermark_verified = await run_in_threadpool(read_photo, published) == watermark_id
+            except Exception as e:
+                print(f"Could not read the watermark back: {e}")
+            if not watermark_verified:
+                print(f"Warning: the watermark of {file_uuid} does not read back")
 
         # 4. R2 Upload
         try:
@@ -434,6 +488,12 @@ async def _ingest_bytes(
             "type": "image",
             **membership,
         }
+        if watermark_id is not None:
+            payload.update(
+                watermark_id=format_watermark_id(watermark_id),
+                watermark_model=settings.WATERMARK_MODEL_TYPE,
+                watermark_verified=watermark_verified,
+            )
 
         await qdrant_wrapper.upsert_point(
             point_id=point_id,
@@ -459,6 +519,11 @@ async def _ingest_bytes(
             "original_url": r2_url_original,
             "metadata_used_for_sparse": metadata_text,
             "collection_ids": membership["collection_ids"],
+            "watermark": (
+                {"id": payload["watermark_id"], "verified": watermark_verified}
+                if watermark_id is not None
+                else None
+            ),
         }
 
     except HTTPException as he:
@@ -477,21 +542,29 @@ async def ingest_image(
     camera: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     allow_duplicate: bool = Form(False),
+    watermark: bool = Form(False),
 ):
     """
     Ingest an image sent directly as multipart form data:
     1. Get the image's dense (CLIP) embedding from the embedding service
     2. Refuse it (409) if it looks like an image already in the gallery, unless allow_duplicate
-    3. Save Preview & Original Versions to R2
-    4. Generate Sparse Embedding from Metadata
-    5. Save to Qdrant
+    3. With watermark, add an invisible TrustMark watermark (see _ingest_bytes)
+    4. Save Preview & Original Versions to R2
+    5. Generate Sparse Embedding from Metadata
+    6. Save to Qdrant
 
     Hosts with request-body limits (e.g. Vercel) cannot use this for large files;
     use /upload/presign + /ingest/staged instead.
     """
     file_bytes = await file.read()
     return await _ingest_bytes(
-        file_bytes, title, taken_time, camera, description, allow_duplicate=allow_duplicate
+        file_bytes,
+        title,
+        taken_time,
+        camera,
+        description,
+        allow_duplicate=allow_duplicate,
+        watermark=watermark,
     )
 
 
@@ -533,6 +606,8 @@ class StagedIngestRequest(BaseModel):
     collection_ids: Optional[List[str]] = None
     # Ingest even if the image looks like one already in the gallery (after the admin saw the 409)
     allow_duplicate: bool = False
+    # Add an invisible TrustMark watermark before publishing
+    watermark: bool = False
 
 
 class StagedDiscardRequest(BaseModel):
@@ -604,6 +679,7 @@ async def ingest_staged_image(
         req.description,
         collection_ids,
         allow_duplicate=req.allow_duplicate,
+        watermark=req.watermark,
     )
     try:
         await run_in_threadpool(delete_object, req.key)
@@ -629,6 +705,50 @@ async def discard_staged_image(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not discard the upload: {e}")
     return {"status": "discarded", "key": req.key}
+
+
+class WatermarkCheckRequest(BaseModel):
+    key: str
+
+
+class WatermarkCheckResponse(BaseModel):
+    found: bool
+    # The id the watermark carries (16 hex digits), when one was found
+    watermark_id: Optional[str] = None
+    # The photo in the gallery that carries it; None for a mark that is not from this gallery
+    image: Optional[SearchResult] = None
+
+
+@app.post("/admin/watermark/detect", response_model=WatermarkCheckResponse)
+async def admin_detect_watermark(
+    req: WatermarkCheckRequest, username: str = Depends(verify_credentials)
+):
+    """
+    Look for a TrustMark watermark in an image the browser uploaded to the staging area (see
+    /upload/presign), also turned by 90, 180 and 270 degrees. The staged file is deleted whatever the
+    outcome. A watermark this gallery wrote comes back with the photo it belongs to.
+    """
+    file_bytes = await _load_staged(req.key)
+    try:
+        await run_in_threadpool(delete_object, req.key)
+    except Exception as e:
+        print(f"Warning: failed to delete staged object {req.key}: {e}")
+    try:
+        found = await run_in_threadpool(read_photo, file_bytes, True)
+    except WatermarkUnavailable as e:
+        raise HTTPException(status_code=503, detail=f"Watermark check unavailable: {e}")
+    except (UnidentifiedImageError, OSError, ValueError):
+        raise HTTPException(status_code=400, detail="Could not read the image")
+    if found is None:
+        return WatermarkCheckResponse(found=False)
+
+    watermark_id = format_watermark_id(found)
+    point = await qdrant_wrapper.find_point_by_watermark(watermark_id)
+    return WatermarkCheckResponse(
+        found=True,
+        watermark_id=watermark_id,
+        image=_to_search_result(str(point.id), point.payload or {}) if point else None,
+    )
 
 
 async def _describe_bytes(file_bytes: bytes) -> GenerateDescriptionResponse:
