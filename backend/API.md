@@ -169,9 +169,10 @@ a retry. 14 finds a watermark again.
 
 The models (`encoder_Q.onnx`, 17 MB, and `decoder_Q.onnx`, 47 MB) are fetched into
 `WATERMARK_MODEL_DIR` (default `backend/models/trustmark`) by `python -m core.watermark`, which the
-Docker build runs; elsewhere they are fetched on first use. They are loaded into memory only when a
-photo is watermarked or checked, one image is processed at a time, and they are dropped again after
-`WATERMARK_IDLE_SECONDS` (default 600) without use. `WATERMARK_THREADS` (default 2) caps the CPU threads.
+Docker build runs; elsewhere they are fetched on first use. Nothing stays in memory: each image loads the
+one model it needs (~0.05 s) and drops it, with everything else it used, as soon as it is done (the
+encoder even before the full-size arithmetic), one image at a time. Watermarking a 24 MP upload takes
+about 50-80 MB more at its peak than a plain upload. `WATERMARK_THREADS` (default 2) caps the CPU threads.
 
 ### 4.1 Browser-direct upload (presign + ingest staged)
 

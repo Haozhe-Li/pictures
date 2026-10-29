@@ -51,12 +51,10 @@ class Settings:
 
     # TrustMark invisible watermarks (core/watermark). Variant Q, fixed: a mark can only be read with the
     # variant that wrote it. Its ONNX models are fetched into WATERMARK_MODEL_DIR when the Docker image is
-    # built, and loaded only while a photo is watermarked or checked; after WATERMARK_IDLE_SECONDS
-    # without use they are dropped again.
+    # built, and loaded only while a photo is watermarked or checked.
     WATERMARK_MODEL_TYPE = "Q"
     WATERMARK_MODEL_DIR = os.getenv("WATERMARK_MODEL_DIR", os.path.join(MODELS_DIR, "trustmark"))
     WATERMARK_THREADS = int(os.getenv("WATERMARK_THREADS", "2"))
-    WATERMARK_IDLE_SECONDS = float(os.getenv("WATERMARK_IDLE_SECONDS", "600"))
 
 
 settings = Settings()

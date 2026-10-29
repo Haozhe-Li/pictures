@@ -33,11 +33,16 @@ def _md5(path: str) -> str:
     return digest.hexdigest()
 
 
+# Files already checked by this process (each image loads its model again)
+_checked = set()
+
+
 def ensure_model(name: str) -> str:
     """The path of model file `name`, fetched first if it is missing or not the expected file."""
     expected = MODEL_CHECKSUMS[name]
     path = os.path.join(settings.WATERMARK_MODEL_DIR, name)
-    if os.path.isfile(path) and _md5(path) == expected:
+    if path in _checked or (os.path.isfile(path) and _md5(path) == expected):
+        _checked.add(path)
         return path
 
     print(f"Fetching TrustMark model {name}...")
@@ -53,6 +58,7 @@ def ensure_model(name: str) -> str:
             raise RuntimeError(f"{name} has MD5 {actual}, expected {expected}")
         os.chmod(partial, 0o644)  # mkstemp makes it private to whoever fetched it
         os.replace(partial, path)
+        _checked.add(path)
     finally:
         if os.path.exists(partial):
             os.remove(partial)

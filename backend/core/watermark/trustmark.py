@@ -8,7 +8,8 @@
 # Vendored from adobe/trustmark, python-hailo/trustmark_hailo/pipeline.py (commit 6df5a0a, MIT, see
 # LICENSE): TrustMark's encode/decode around two injected forward passes, with numpy and Pillow only.
 # Trimmed to what the gallery uses: the bounding-box detector (localize, DETECTFIRST) and decode() are left
-# out; core/watermark/__init__.py reads marks with subimage_decode().
+# out; core/watermark/__init__.py reads marks with subimage_decode(). encode() builds the full-size result
+# one channel at a time and leaves out needless copies, to fit a small server (see there).
 
 from __future__ import annotations
 
@@ -46,17 +47,12 @@ EncoderInfer = Callable[[np.ndarray, np.ndarray], np.ndarray]
 DecoderInfer = Callable[[np.ndarray], np.ndarray]
 
 
-def _resize_float_hwc(arr: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    """Resize an (H,W,3) float array (arbitrary range) with bilinear
-    interpolation, channel-by-channel via PIL's 'F' mode (avoids requiring
-    torch or opencv just for this one resize)."""
-    w, h = size
-    out = np.empty((h, w, arr.shape[2]), dtype=np.float32)
-    for c in range(arr.shape[2]):
-        # A 2-D float32 array is mode "F"; Pillow 11.3 deprecated passing the mode
-        band = Image.fromarray(arr[:, :, c].astype(np.float32))
-        out[:, :, c] = np.asarray(band.resize((w, h), Image.BILINEAR))
-    return out
+def _resize_float_band(band: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Resize an (H,W) float array (arbitrary range) with bilinear interpolation via PIL's 'F' mode (avoids
+    requiring torch or opencv just for this one resize). Returns a writable float32 array."""
+    # A 2-D float32 array is mode "F"; Pillow 11.3 deprecated passing the mode
+    resized = Image.fromarray(band.astype(np.float32)).resize(size, Image.BILINEAR)
+    return np.array(resized, dtype=np.float32)
 
 
 class TrustMarkCore:
@@ -101,8 +97,8 @@ class TrustMarkCore:
         else:
             aspect_ratio = height / width
 
-        # Make a copy of the image (PIL)
-        out_im = in_image.copy()
+        # crop() below makes the new image; upstream copies the whole photo first as well
+        out_im = in_image
 
         if aspect_ratio > self.aspect_ratio_lim:
             # We do a center-square approach, but scaled
@@ -238,21 +234,27 @@ class TrustMarkCore:
         residual = stego_hwc - cover_hwc
         residual = residual - residual.mean(axis=(0, 1), keepdims=True)  # remove per-channel color shift
 
-        # Upstream: np.clip(residual_full * WM_STRENGTH + cover_arr / 127.5 - 1.0, -1, 1) * 127.5 + 127.5,
-        # worked in place here so a full-size photo needs two float arrays at a time rather than five
-        stego_full = _resize_float_hwc(residual, (w, h))
-        stego_full *= WM_STRENGTH
-        cover_arr = np.asarray(cover_image, dtype=np.float32)
-        cover_arr /= 127.5
-        stego_full += cover_arr
+        # Upstream computes np.clip(residual_full * WM_STRENGTH + cover_arr / 127.5 - 1.0, -1, 1) * 127.5 + 127.5
+        # over the whole photo in float arrays (five of them at a time, ~350 MB for 3000 px). The same sums
+        # go one channel at a time here, in place, and straight to 8 bits as the paste below would cast them,
+        # so only one channel's floats exist at a time. Only the feathered border blends 8-bit values rather
+        # than floats, which moves a pixel there by at most one level.
+        cover_arr = np.asarray(cover_image)
+        stego_full = np.empty((h, w, 3), dtype=np.uint8)
+        for c in range(3):
+            band = _resize_float_band(residual[:, :, c], (w, h))
+            band *= WM_STRENGTH
+            band += np.divide(cover_arr[:, :, c], 127.5, dtype=np.float32)
+            band -= 1.0
+            np.clip(band, -1, 1, out=band)
+            band *= 127.5
+            band += 127.5
+            stego_full[:, :, c] = band
+            del band
         del cover_arr
-        stego_full -= 1.0
-        np.clip(stego_full, -1, 1, out=stego_full)
-        stego_full *= 127.5
-        stego_full += 127.5
 
-        stego = self.put_the_image_after_processing(stego_full, np.asarray(in_cover_image).astype(np.uint8))
-        return Image.fromarray(stego.astype(np.uint8))
+        stego = self.put_the_image_after_processing(stego_full, np.asarray(in_cover_image))
+        return Image.fromarray(stego)
 
     def subimage_decode(self, stego_image: Image.Image, MODE: str = "binary"):
         stego_nchw = pil_to_model_input(stego_image, self.decoder_resolution)
