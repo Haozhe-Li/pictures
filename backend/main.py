@@ -760,6 +760,13 @@ async def admin_list_images(
     )
 
 
+@app.get("/admin/images/{image_id}", response_model=SearchResult)
+async def admin_get_image(image_id: str, username: str = Depends(verify_credentials)):
+    """One image with its whole payload (the public /image/{id} leaves `collections_opt_out` out)."""
+    point = await _require_point(image_id)
+    return _to_search_result(str(point.id), point.payload or {})
+
+
 @app.patch("/admin/images/{image_id}", response_model=SearchResult)
 async def admin_update_image(
     image_id: str,

@@ -362,6 +362,13 @@ Stable, paginated listing of every image (`/gallery` is a random feed and cannot
   }
   ```
 
+### 11.1a Get One Image
+
+- **URL**: `GET /admin/images/{id}`
+- **Response**: the image in the same shape as an item of `/admin/images`, with the whole payload as
+  `metadata` (including `collections_opt_out`, which public responses leave out).
+- **Errors**: `404` unknown id.
+
 ### 11.2 Update Metadata
 
 - **URL**: `PATCH /admin/images/{image_id}`
