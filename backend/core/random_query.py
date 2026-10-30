@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from core.config import settings
 from core.embedding import EmbeddingClient
+from core.gallery_collections import is_canonical_uuid
 from core.generate_description import chat_model
 
 # Redis queue of ready-to-serve random queries. Each item is a JSON object
@@ -198,7 +199,7 @@ class RandomQueryManager:
             for rank in ranks:
                 pipe.zrange(IMAGE_POOL_KEY, rank, rank)
             found = await pipe.execute()
-        ids = [i for hit in found for i in hit if i not in exclude]
+        ids = [i for hit in found for i in hit if i not in exclude and is_canonical_uuid(i)]
 
         images: List[Dict[str, str]] = []
         for point in await self.qdrant.get_points(ids):

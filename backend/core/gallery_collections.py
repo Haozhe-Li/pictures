@@ -87,6 +87,11 @@ def is_uuid(value: str) -> bool:
         return False
 
 
+def is_canonical_uuid(value: str) -> bool:
+    """A UUID in the exact form Qdrant ids are stored in, which is_uuid alone does not ensure."""
+    return is_uuid(value) and str(uuid.UUID(value)) == value
+
+
 def unique_slug(base: str, taken: Set[str]) -> str:
     """`base`, or `base` with a short random suffix when it is taken. Never a UUID (ids are)."""
     slug = base

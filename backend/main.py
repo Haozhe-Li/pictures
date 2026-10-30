@@ -2048,7 +2048,10 @@ async def get_gallery(request: FeedRequest):
         # 1. Fetch hot images (Exploit)
         # Fetch enough to account for seen_ids
         hot_pool = await redis_client.zrevrange("gallery:pool:active", 0, fetch_count)
-        available_hot = [cid for cid in hot_pool if cid not in seen_set]
+        # A malformed id would fail the whole Qdrant retrieve below
+        available_hot = [
+            cid for cid in hot_pool if cid not in seen_set and gc.is_canonical_uuid(cid)
+        ]
         hot_ids = available_hot[:hot_limit]
 
         # 2. Fetch cold images (Explore)
@@ -2056,7 +2059,9 @@ async def get_gallery(request: FeedRequest):
         cold_pool = await redis_client.zrange("gallery:pool:explore", 0, fetch_count)
         # Exclude IDs already in hot_ids and seen_ids; preserve ascending score order
         available_cold = [
-            cid for cid in cold_pool if cid not in seen_set and cid not in hot_ids
+            cid
+            for cid in cold_pool
+            if cid not in seen_set and cid not in hot_ids and gc.is_canonical_uuid(cid)
         ]
 
         # Take least-shown items first (front of list has lowest impression counts).
@@ -2098,23 +2103,31 @@ async def get_gallery(request: FeedRequest):
 
 
 class InteractRequest(BaseModel):
-    image_id: str
-    action_type: str  # 'click' or 'share'
+    image_id: uuid.UUID
+    action_type: Literal["click", "share"]
+
+
+INTERACTION_WEIGHTS = {"click": 2, "share": 4}
 
 
 @app.post("/interact")
 async def interact_image(request: InteractRequest):
     """
-    Interaction loop for tracking clicks and shares.
+    Interaction loop for tracking clicks and shares. This endpoint is public, so it only scores
+    images already in the pool (which holds every ingested image): XX keeps it from adding members.
+    An unknown id gets the same response, so this cannot be used to probe which ids exist.
     """
     try:
-        image_id = request.image_id
-        if request.action_type == "click":
-            await redis_client.hincrby("gallery:counters:click", image_id, 1)
-            await redis_client.zincrby("gallery:pool:active", 2, image_id)
-        elif request.action_type == "share":
-            await redis_client.hincrby("gallery:counters:share", image_id, 1)
-            await redis_client.zincrby("gallery:pool:active", 4, image_id)
+        image_id = str(request.image_id)
+        action = request.action_type
+        score = await redis_client.zadd(
+            "gallery:pool:active",
+            {image_id: INTERACTION_WEIGHTS[action]},
+            xx=True,
+            incr=True,
+        )
+        if score is not None:
+            await redis_client.hincrby(f"gallery:counters:{action}", image_id, 1)
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
