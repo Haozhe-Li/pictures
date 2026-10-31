@@ -220,8 +220,9 @@ keeps its default, and photos are never scaled up:
 | `original_quality` | 90 | 1-100 |
 | `original_max_size` | 3000 | 100-6000 |
 
-With `watermark`, an `original_max_size` above 3000 is refused (`400`) before anything is downloaded:
-the watermark's memory use grows with the published size. `/ingest` always uses the defaults.
+The watermark's memory use grows with `original_max_size`: sizes above the default 3000 are allowed
+with `watermark`, but have not been measured and may run a small server out of memory. `/ingest` always
+uses the defaults.
 
 **Describing: `POST /ingest/staged/describe`** (JSON `{ "key": "staging/<uuid>.jpg" }`) suggests a
 title and description for a staged image, as in 6. The staged object stays, so it can be ingested or

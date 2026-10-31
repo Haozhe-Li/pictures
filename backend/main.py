@@ -313,8 +313,8 @@ class DuplicateMatch(BaseModel):
     score: float
 
 
-# Long edge of the published original (`<uuid>_original.webp`) by default, and the most a watermarked
-# one can have: the watermark's float math on anything larger takes the server out of memory
+# Long edge of the published original (`<uuid>_original.webp`) by default. The watermark's memory use
+# grows with this size: the admin can go up to PUBLISH_MAX_SIZE, at the risk of an out-of-memory crash.
 ORIGINAL_MAX_SIZE = 3000
 PUBLISH_MAX_SIZE = 6000
 
@@ -697,11 +697,6 @@ async def ingest_staged_image(
     Ingest an image the browser already uploaded to the R2 staging area: download
     it, run the normal ingest pipeline, then delete the staged object.
     """
-    if req.watermark and req.publish.original_max_size > ORIGINAL_MAX_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail=f"A watermarked photo can be at most {ORIGINAL_MAX_SIZE} px on its long edge",
-        )
     collection_ids = None
     if req.collection_ids is not None:
         # Reject unknown collections before downloading and publishing anything
