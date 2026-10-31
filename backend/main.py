@@ -313,8 +313,23 @@ class DuplicateMatch(BaseModel):
     score: float
 
 
-# Long edge of the published original (`<uuid>_original.webp`)
+# Long edge of the published original (`<uuid>_original.webp`) by default, and the most a watermarked
+# one can have: the watermark's float math on anything larger takes the server out of memory
 ORIGINAL_MAX_SIZE = 3000
+PUBLISH_MAX_SIZE = 6000
+
+
+class PublishSettings(BaseModel):
+    """WebP quality and long edge of the published files. Photos are never scaled up."""
+
+    preview_quality: int = Field(5, ge=1, le=100)
+    preview_max_size: int = Field(1200, ge=100, le=PUBLISH_MAX_SIZE)
+    original_quality: int = Field(90, ge=1, le=100)
+    original_max_size: int = Field(ORIGINAL_MAX_SIZE, ge=100, le=PUBLISH_MAX_SIZE)
+
+# One full-size photo in memory at a time. The server is small: a second one on top of an ingest's
+# peak can run it out of memory, and the browser no longer spaces these requests out on its own.
+_image_work = asyncio.Lock()
 
 
 def _read_file(path: str) -> bytes:
@@ -348,6 +363,7 @@ async def _ingest_bytes(
     collection_ids: Optional[List[str]] = None,
     allow_duplicate: bool = False,
     watermark: bool = False,
+    publish: Optional[PublishSettings] = None,
 ):
     """
     Shared ingest pipeline (see /ingest for the steps). Takes the raw image bytes
@@ -364,6 +380,7 @@ async def _ingest_bytes(
     An image that looks like one already in the gallery is refused with 409 and the closest
     matches, before anything is written, unless `allow_duplicate` is set.
     """
+    publish = publish or PublishSettings()
     try:
         # 1. CLIP vector of the image. It comes first, so a likely duplicate is caught before
         #    anything is converted or published. The embedding service gets a downscaled JPEG.
@@ -400,7 +417,7 @@ async def _ingest_bytes(
         file_uuid = uuid.uuid4()
 
         # Generate filenames for R2 (WebP)
-        # Preview: quality 5, long edge 1200; Original: quality 90, long edge 3000
+        # Quality and long edge of each file come from `publish`
         storage_filename_preview = f"{file_uuid}_preview.webp"
         storage_filename_original = f"{file_uuid}_original.webp"
 
@@ -414,19 +431,27 @@ async def _ingest_bytes(
         if watermark_id is not None:
             try:
                 source = await run_in_threadpool(
-                    watermark_photo, file_bytes, watermark_id, ORIGINAL_MAX_SIZE
+                    watermark_photo, file_bytes, watermark_id, publish.original_max_size
                 )
             except WatermarkUnavailable as e:
                 raise HTTPException(status_code=503, detail=f"Watermark unavailable: {e}")
 
-        # 3.2 Save Preview (Quality 5) with lower resolution
+        # 3.2 Save Preview with lower resolution
         await run_in_threadpool(
-            save_as_webp, source, temp_filename_preview, 5, max_size=1200
+            save_as_webp,
+            source,
+            temp_filename_preview,
+            publish.preview_quality,
+            max_size=publish.preview_max_size,
         )
 
-        # 3.3 Save Original (Quality 90)
+        # 3.3 Save Original
         await run_in_threadpool(
-            save_as_webp, source, temp_filename_original, 90, max_size=ORIGINAL_MAX_SIZE
+            save_as_webp,
+            source,
+            temp_filename_original,
+            publish.original_quality,
+            max_size=publish.original_max_size,
         )
         del source
 
@@ -557,15 +582,16 @@ async def ingest_image(
     use /upload/presign + /ingest/staged instead.
     """
     file_bytes = await file.read()
-    return await _ingest_bytes(
-        file_bytes,
-        title,
-        taken_time,
-        camera,
-        description,
-        allow_duplicate=allow_duplicate,
-        watermark=watermark,
-    )
+    async with _image_work:
+        return await _ingest_bytes(
+            file_bytes,
+            title,
+            taken_time,
+            camera,
+            description,
+            allow_duplicate=allow_duplicate,
+            watermark=watermark,
+        )
 
 
 # --- Browser -> R2 -> backend upload flow ---
@@ -608,9 +634,15 @@ class StagedIngestRequest(BaseModel):
     allow_duplicate: bool = False
     # Add an invisible TrustMark watermark before publishing
     watermark: bool = False
+    # WebP quality and long edge of the published files; each left out keeps its default
+    publish: PublishSettings = Field(default_factory=PublishSettings)
 
 
 class StagedDiscardRequest(BaseModel):
+    key: str
+
+
+class StagedDescribeRequest(BaseModel):
     key: str
 
 
@@ -665,28 +697,51 @@ async def ingest_staged_image(
     Ingest an image the browser already uploaded to the R2 staging area: download
     it, run the normal ingest pipeline, then delete the staged object.
     """
+    if req.watermark and req.publish.original_max_size > ORIGINAL_MAX_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A watermarked photo can be at most {ORIGINAL_MAX_SIZE} px on its long edge",
+        )
     collection_ids = None
     if req.collection_ids is not None:
         # Reject unknown collections before downloading and publishing anything
         collection_ids = gc.dedupe(req.collection_ids)
         await _require_collections(collection_ids)
-    file_bytes = await _load_staged(req.key)
-    result = await _ingest_bytes(
-        file_bytes,
-        req.title,
-        req.taken_time,
-        req.camera,
-        req.description,
-        collection_ids,
-        allow_duplicate=req.allow_duplicate,
-        watermark=req.watermark,
-    )
+    async with _image_work:
+        file_bytes = await _load_staged(req.key)
+        result = await _ingest_bytes(
+            file_bytes,
+            req.title,
+            req.taken_time,
+            req.camera,
+            req.description,
+            collection_ids,
+            allow_duplicate=req.allow_duplicate,
+            watermark=req.watermark,
+            publish=req.publish,
+        )
     try:
         await run_in_threadpool(delete_object, req.key)
     except Exception as e:
         # The image is already published; a leftover staged object is swept by the lifecycle rule.
         print(f"Warning: failed to delete staged object {req.key}: {e}")
     return result
+
+
+@app.post("/ingest/staged/describe", response_model=GenerateDescriptionResponse)
+async def describe_staged_image(
+    req: StagedDescribeRequest, username: str = Depends(verify_credentials)
+):
+    """
+    Suggest a title and description for an image waiting in the staging area. The staged
+    object stays: the admin ingests or discards it afterwards.
+    """
+    async with _image_work:
+        file_bytes = await _load_staged(req.key)
+        image_base64 = await _prepare_for_llm(file_bytes)
+        del file_bytes
+    # The LLM can take a while and needs no photo in memory: ingests go on meanwhile
+    return await _describe_prepared(image_base64)
 
 
 @app.post("/ingest/staged/discard")
@@ -751,15 +806,19 @@ async def admin_detect_watermark(
     )
 
 
-async def _describe_bytes(file_bytes: bytes) -> GenerateDescriptionResponse:
-    """Runs the LLM captioner on raw image bytes (downscaled first)."""
+async def _prepare_for_llm(file_bytes: bytes) -> str:
+    """Compresses and resizes raw image bytes for the LLM captioner."""
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
     try:
-        if not file_bytes:
-            raise HTTPException(status_code=400, detail="Empty file")
+        return await run_in_threadpool(process_image_for_embedding, file_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-        # Compress/resize before sending to LLM
-        image_base64 = await run_in_threadpool(process_image_for_embedding, file_bytes)
 
+async def _describe_prepared(image_base64: str) -> GenerateDescriptionResponse:
+    """Runs the LLM captioner on an image from _prepare_for_llm."""
+    try:
         result = await description_generator.generate(image_base64)
 
         title, description = result.title.strip(), result.description.strip()
@@ -774,6 +833,11 @@ async def _describe_bytes(file_bytes: bytes) -> GenerateDescriptionResponse:
         raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _describe_bytes(file_bytes: bytes) -> GenerateDescriptionResponse:
+    """Runs the LLM captioner on raw image bytes (downscaled first)."""
+    return await _describe_prepared(await _prepare_for_llm(file_bytes))
 
 
 @app.post("/generate-description", response_model=GenerateDescriptionResponse)

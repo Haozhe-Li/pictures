@@ -159,7 +159,7 @@ image is and the closest pairs.
 
 **Watermarks.** With `watermark`, the photo gets an invisible [TrustMark](https://github.com/adobe/trustmark)
 watermark (Adobe's, variant Q, run on ONNX Runtime; vendored in `core/watermark`) carrying a new random
-61-bit id. The order is: duplicate check, scale to the published size (long edge 3000), watermark, then
+61-bit id. The order is: duplicate check, scale to the published size (`original_max_size`, default 3000), watermark, then
 the preview and original WebP files are made from the watermarked photo. The id is then read back from
 the published original, and the image record gets `watermark_id` (16 hex digits), `watermark_model`
 (`"Q"`) and `watermark_verified` (whether it read back; a photo whose mark does not read is still
@@ -209,6 +209,26 @@ anything is downloaded or published.
 Runs the same pipeline as `/ingest` and returns the same response, plus the image's `collection_ids`.
 A likely duplicate is refused with `409` as in 4; the staged object is kept, so the request can be
 repeated with `allow_duplicate: true` without uploading the file again.
+
+`publish` (object, optional) sets the published files' WebP quality and long edge; each field left out
+keeps its default, and photos are never scaled up:
+
+| Field | Default | Range |
+| --- | --- | --- |
+| `preview_quality` | 5 | 1-100 |
+| `preview_max_size` | 1200 | 100-6000 |
+| `original_quality` | 90 | 1-100 |
+| `original_max_size` | 3000 | 100-6000 |
+
+With `watermark`, an `original_max_size` above 3000 is refused (`400`) before anything is downloaded:
+the watermark's memory use grows with the published size. `/ingest` always uses the defaults.
+
+**Describing: `POST /ingest/staged/describe`** (JSON `{ "key": "staging/<uuid>.jpg" }`) suggests a
+title and description for a staged image, as in 6. The staged object stays, so it can be ingested or
+discarded afterwards. `400` for an invalid key, `404` when the object is gone.
+
+Backend work on a full-size photo (ingest, reading a staged photo to describe it) runs one image at a
+time; a request waits for the one before it.
 
 **Discarding: `POST /ingest/staged/discard`** (JSON `{ "key": "staging/<uuid>.jpg" }`) deletes a staged
 object that will not be ingested, e.g. a duplicate the admin skipped. `400` for a key outside
