@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 
 # Shared by every LLM call in the backend (captions here, query rewriting in random_query).
 # Reasoning is switched off; everything else is left at the defaults.
-chat_model = ChatOpenAI(model="gpt-5.6-luna", reasoning_effort="none")
+chat_model = ChatOpenAI(model="gpt-6-luna", reasoning_effort="none", temperature=0.7)
 
 
 class ImageDescription(BaseModel):
