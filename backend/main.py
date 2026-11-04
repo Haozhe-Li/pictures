@@ -2213,37 +2213,40 @@ DECAY_FLOOR = 0.1  # Scores below this collapse to 0
 DECAY_BATCH = 500
 
 
-async def _decay_active_pool():
+async def _decay_active_pool(manual: bool = False) -> int:
     """
-    Multiplicatively decay every score in the active pool.
+    Multiplicatively decay every score in the active pool; returns how many scores changed.
 
-    Runs from a background loop (not in a request) and batches writes into
-    pipelines, so a large pool cannot stall the caller.
+    Runs from a background loop (or the admin's "decay now"), not in a feed request, and
+    batches writes into pipelines, so a large pool cannot stall the caller. The time and
+    size of the run are kept in `gallery:decay:last` for the admin.
     """
-    try:
-        photos = await redis_client.zrange(
-            "gallery:pool:active", 0, -1, withscores=True
-        )
+    photos = await redis_client.zrange(
+        "gallery:pool:active", 0, -1, withscores=True
+    )
 
-        pipe = redis_client.pipeline(transaction=False)
-        pending = 0
-        for photo_id, score in photos:
-            if score == 0:
-                continue
-            new_score = score * DECAY_FACTOR
-            if new_score < DECAY_FLOOR:
-                new_score = 0
-            pipe.zadd("gallery:pool:active", {photo_id: new_score})
-            pending += 1
-            if pending % DECAY_BATCH == 0:
-                await pipe.execute()
-
-        if pending % DECAY_BATCH:
+    pipe = redis_client.pipeline(transaction=False)
+    pending = 0
+    for photo_id, score in photos:
+        if score == 0:
+            continue
+        new_score = score * DECAY_FACTOR
+        if new_score < DECAY_FLOOR:
+            new_score = 0
+        pipe.zadd("gallery:pool:active", {photo_id: new_score})
+        pending += 1
+        if pending % DECAY_BATCH == 0:
             await pipe.execute()
 
-        print(f"Decay applied to {pending} photos.")
-    except Exception as e:
-        print(f"Decay Error: {e}")
+    if pending % DECAY_BATCH:
+        await pipe.execute()
+
+    await redis_client.hset(
+        "gallery:decay:last",
+        mapping={"at": time.time(), "count": pending, "manual": int(manual)},
+    )
+    print(f"Decay applied to {pending} photos.")
+    return pending
 
 
 DECAY_CHECK_INTERVAL_SECONDS = 600  # How often the background loop tries to open a window
@@ -2276,6 +2279,174 @@ async def _decay_loop():
         except Exception as e:
             print(f"Decay loop error: {e}")
         await asyncio.sleep(DECAY_CHECK_INTERVAL_SECONDS)
+
+
+# --- Admin: recommendation pools ---
+
+# The feed's two pools: `active` (hot) is served highest score first, `explore` (new) lowest
+# impression count first, so a rank is always the position in the order the feed reads it.
+POOL_KEYS = {"active": "gallery:pool:active", "explore": "gallery:pool:explore"}
+PoolName = Literal["active", "explore"]
+
+
+class PoolEntry(BaseModel):
+    id: str
+    rank: int  # 1-based, in the order the feed reads the pool
+    score: float
+    title: Optional[str] = None
+    preview_url: Optional[str] = None
+    clicks: int = 0
+    shares: int = 0
+    # False for an id Qdrant no longer has (the feed skips it)
+    in_library: bool = True
+
+
+class PoolPage(BaseModel):
+    pool: PoolName
+    total: int
+    offset: int
+    items: List[PoolEntry]
+
+
+class PoolRank(BaseModel):
+    pool: PoolName
+    id: str
+    rank: int
+    score: float
+    total: int
+
+
+class PoolScoreRequest(BaseModel):
+    score: float = Field(ge=0, le=1e9, allow_inf_nan=False)
+
+
+async def _pool_rank(pool: str, image_id: str) -> Optional[PoolRank]:
+    key = POOL_KEYS[pool]
+    pipe = redis_client.pipeline(transaction=False)
+    pipe.zrevrank(key, image_id) if pool == "active" else pipe.zrank(key, image_id)
+    pipe.zscore(key, image_id)
+    pipe.zcard(key)
+    rank, score, total = await pipe.execute()
+    if rank is None:
+        return None
+    return PoolRank(pool=pool, id=image_id, rank=rank + 1, score=score, total=total)
+
+
+@app.get("/admin/pools")
+async def admin_pools_status(username: str = Depends(verify_credentials)):
+    """
+    Size of each pool, the decay settings, the last decay (scheduled or manual) and
+    how long until the next scheduled one may run.
+    """
+    pipe = redis_client.pipeline(transaction=False)
+    for key in POOL_KEYS.values():
+        pipe.zcard(key)
+    pipe.ttl("gallery:decay:lock")
+    pipe.hgetall("gallery:decay:last")
+    *sizes, ttl, last = await pipe.execute()
+    return {
+        "pools": dict(zip(POOL_KEYS, sizes)),
+        "graduation_impressions": EXPLORE_GRADUATION_IMPRESSIONS,
+        "decay": {
+            "factor": DECAY_FACTOR,
+            "floor": DECAY_FLOOR,
+            "interval_seconds": DECAY_INTERVAL_SECONDS,
+            # The background loop checks every DECAY_CHECK_INTERVAL_SECONDS once the window opens
+            "seconds_until_next": max(ttl, 0),
+            "last_run_at": float(last["at"]) if last else None,
+            "last_run_count": int(last["count"]) if last else None,
+            "last_run_manual": last.get("manual") == "1" if last else None,
+        },
+    }
+
+
+@app.get("/admin/pools/{pool}", response_model=PoolPage)
+async def admin_pool_page(
+    pool: PoolName,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    username: str = Depends(verify_credentials),
+):
+    """
+    A page of a pool's ranking, in the order the feed reads it, with each image's title,
+    preview and click/share counters.
+    """
+    key = POOL_KEYS[pool]
+    read = redis_client.zrevrange if pool == "active" else redis_client.zrange
+    entries = await read(key, offset, offset + limit - 1, withscores=True)
+    total = await redis_client.zcard(key)
+
+    if not entries:
+        return PoolPage(pool=pool, total=total, offset=offset, items=[])
+
+    ids = [image_id for image_id, _ in entries]
+    pipe = redis_client.pipeline(transaction=False)
+    pipe.hmget("gallery:counters:click", ids)
+    pipe.hmget("gallery:counters:share", ids)
+    clicks, shares = await pipe.execute()
+
+    # A malformed id would fail the whole Qdrant retrieve
+    points = await qdrant_wrapper.get_points([i for i in ids if gc.is_canonical_uuid(i)])
+    payloads = {str(p.id): p.payload or {} for p in points}
+
+    items = []
+    for n, (image_id, score) in enumerate(entries):
+        payload = payloads.get(image_id)
+        items.append(
+            PoolEntry(
+                id=image_id,
+                rank=offset + n + 1,
+                score=score,
+                title=payload.get("title") if payload else None,
+                preview_url=payload.get("preview_url") if payload else None,
+                clicks=int(clicks[n] or 0),
+                shares=int(shares[n] or 0),
+                in_library=payload is not None,
+            )
+        )
+    return PoolPage(pool=pool, total=total, offset=offset, items=items)
+
+
+@app.get("/admin/pools/{pool}/{image_id}", response_model=PoolRank)
+async def admin_pool_rank(
+    pool: PoolName, image_id: str, username: str = Depends(verify_credentials)
+):
+    """Where one image stands in a pool. 404 when it is not in it (e.g. graduated from explore)."""
+    found = await _pool_rank(pool, image_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="Not in this pool")
+    return found
+
+
+@app.put("/admin/pools/{pool}/{image_id}", response_model=PoolRank)
+async def admin_set_pool_score(
+    pool: PoolName,
+    image_id: str,
+    req: PoolScoreRequest,
+    username: str = Depends(verify_credentials),
+):
+    """
+    Set an image's score in a pool. An image that is not in the pool (one that graduated
+    from explore, say) is put back in, as long as it is in the library.
+    """
+    key = POOL_KEYS[pool]
+    if await redis_client.zscore(key, image_id) is None:
+        await _require_point(image_id)
+    await redis_client.zadd(key, {image_id: req.score})
+    return await _pool_rank(pool, image_id)
+
+
+@app.post("/admin/pools/decay")
+async def admin_decay_now(username: str = Depends(verify_credentials)):
+    """
+    Decay the active pool once, now. This is an extra decay: the scheduled ones keep
+    their own window.
+    """
+    try:
+        decayed = await _decay_active_pool(manual=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Decay failed: {e}")
+    return {"status": "success", "decayed": decayed}
 
 
 @app.get("/health")

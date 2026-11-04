@@ -714,3 +714,68 @@ Looks for a watermark of 4 in any image. **Requires Authentication (Basic Auth).
   and strong edits remove it.
 - **Errors**: `400` invalid key or not an image, `404` no such staged object, `503` the models could not
   be loaded.
+
+## 15. Admin: Recommendation Pools
+
+The default `/gallery` feed reads two Redis sorted sets. **All endpoints below require Authentication
+(Basic Auth).** `{pool}` is one of:
+
+- `active` (popular): every image; the feed reads it **highest score first**. Clicks add 2, shares 4,
+  each time an image is shown from `explore` adds 1, and the decay multiplies every score by `factor`.
+- `explore` (new): images that have not yet been shown `graduation_impressions` times; the feed reads it
+  **lowest impression count first**, and an image leaves it once it reaches that count.
+
+A `rank` is always 1-based, in the order the feed reads the pool.
+
+### 15.1 Status
+
+- **URL**: `GET /admin/pools`
+- **Response Example**:
+  ```json
+  {
+    "pools": { "active": 128, "explore": 12 },
+    "graduation_impressions": 10,
+    "decay": { "factor": 0.98, "floor": 0.1, "interval_seconds": 7200, "seconds_until_next": 5400,
+               "last_run_at": 1793811129.6, "last_run_count": 97, "last_run_manual": false }
+  }
+  ```
+  `seconds_until_next` is when the next scheduled decay may run (the background loop checks every 10
+  minutes). `last_run_*` is the latest decay, scheduled or manual; `null` before the first one.
+
+### 15.2 Ranking
+
+- **URL**: `GET /admin/pools/{pool}`
+- **Query Parameters**: `offset` (int, default 0), `limit` (1-200, default 50).
+- **Response Example**:
+  ```json
+  {
+    "pool": "active", "total": 128, "offset": 0,
+    "items": [
+      { "id": "uuid", "rank": 1, "score": 14.2, "title": "Summer Beach", "preview_url": "...",
+        "clicks": 5, "shares": 1, "in_library": true }
+    ]
+  }
+  ```
+  `in_library` is `false` for an id Qdrant no longer has (the feed skips it).
+
+### 15.3 One Image's Rank
+
+- **URL**: `GET /admin/pools/{pool}/{image_id}`
+- **Response**: `{ "pool": "active", "id": "uuid", "rank": 7, "score": 3.1, "total": 128 }`
+- **Errors**: `404` the image is not in that pool (e.g. it graduated from `explore`).
+
+### 15.4 Set a Score
+
+- **URL**: `PUT /admin/pools/{pool}/{image_id}`
+- **Request Body (JSON)**: `{ "score": 25 }`, 0 to 1e9.
+- **Response**: the image's new rank, as in 15.3.
+- An image that is not in the pool is put back in, if it is in the library (e.g. to give a graduated
+  image another round in `explore`). In `explore` the score is the impression count, so a score at or
+  above `graduation_impressions` takes the image out the next time it is shown.
+- **Errors**: `404` the image is in neither the pool nor the library, `422` score out of range.
+
+### 15.5 Decay Now
+
+- **URL**: `POST /admin/pools/decay`
+- **Response**: `{ "status": "success", "decayed": 97 }`, the number of non-zero scores decayed.
+- An extra decay of the `active` pool: the scheduled decays keep their own window.
