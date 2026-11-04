@@ -2537,6 +2537,53 @@ async def admin_decay_now(username: str = Depends(verify_credentials)):
     return {"status": "success", "decayed": decayed}
 
 
+@app.post("/admin/pools/{pool}/clear")
+async def admin_clear_pool(pool: PoolName, username: str = Depends(verify_credentials)):
+    """
+    `active`: every score back to 0 (the photos stay, since the pool is the whole library).
+    `explore`: empty the pool, so no photo is shown as new until the next upload.
+    """
+    key = POOL_KEYS[pool]
+    count = await redis_client.zcard(key)
+    if pool == "active":
+        # A union of the set with itself at weight 0 zeroes every score in one atomic command
+        await redis_client.zunionstore(key, {key: 0})
+    else:
+        await redis_client.delete(key)
+    return {"status": "success", "cleared": count}
+
+
+@app.post("/admin/pools/reset")
+async def admin_reset_pools(username: str = Depends(verify_credentials)):
+    """
+    Start the pools over, as init_redis_pools.py does: every photo in the library in both pools
+    at 0, and the click/share counters cleared. The new pools are built under temporary keys
+    and swapped in at once, so the feed never reads a half-built pool.
+    """
+    staging = {key: f"{key}:rebuild" for key in POOL_KEYS.values()}
+    await redis_client.delete(*staging.values())
+    total, offset = 0, None
+    while True:
+        points, offset = await qdrant_wrapper.scroll(limit=500, offset=offset)
+        if points:
+            members = {str(p.id): 0 for p in points}
+            pipe = redis_client.pipeline(transaction=False)
+            for temp in staging.values():
+                pipe.zadd(temp, members)
+            await pipe.execute()
+            total += len(points)
+        if offset is None:
+            break
+
+    pipe = redis_client.pipeline(transaction=True)
+    for key, temp in staging.items():
+        # RENAME fails on a missing key (an empty library); drop the pool instead
+        pipe.rename(temp, key) if total else pipe.delete(key)
+    pipe.delete("gallery:counters:click", "gallery:counters:share")
+    await pipe.execute()
+    return {"status": "success", "photos": total}
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""

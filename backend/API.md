@@ -789,3 +789,19 @@ A `rank` is always 1-based, in the order the feed reads the pool.
 - **URL**: `POST /admin/pools/decay`
 - **Response**: `{ "status": "success", "decayed": 97 }`, the number of non-zero scores decayed.
 - An extra decay of the `active` pool: the scheduled decays keep their own window.
+
+### 15.6 Clear a Pool
+
+- **URL**: `POST /admin/pools/{pool}/clear`
+- **Response**: `{ "status": "success", "cleared": 128 }`, how many photos were in the pool.
+- `active`: every score goes back to 0 in one atomic command. The photos stay (the pool is the whole
+  library); the click/share counters are kept.
+- `explore`: the pool is emptied, so no photo is served as new until the next ingest (or 15.7).
+
+### 15.7 Reset Both Pools
+
+- **URL**: `POST /admin/pools/reset`
+- **Response**: `{ "status": "success", "photos": 128 }`
+- Like `init_redis_pools.py`: every photo in the library goes into both pools at 0, ids no longer in
+  the library are dropped, and the click/share counters are deleted. The pools are built under temporary
+  keys and swapped in with one transaction, so the feed never reads a half-built pool.
