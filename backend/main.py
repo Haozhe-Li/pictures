@@ -83,6 +83,13 @@ async def lifespan(app: FastAPI):
             print(f"Set taken_at on {filled} image(s).")
     except Exception as e:
         print(f"Warning: could not backfill taken_at: {e}")
+    # Photos from before addresses existed get theirs
+    try:
+        filled = await _backfill_photo_slugs()
+        if filled:
+            print(f"Gave {filled} photo(s) an address.")
+    except Exception as e:
+        print(f"Warning: could not backfill photo slugs: {e}")
     # Collections from before addresses existed get theirs
     try:
         filled = await _backfill_collection_slugs()
@@ -120,7 +127,13 @@ app.add_middleware(
 
 # Bookkeeping the public site has no use for. The watermark id stays with the admin, whose watermark
 # check is what turns it back into a photo.
-PRIVATE_FIELDS = {"collections_opt_out", "watermark_id", "watermark_model", "watermark_verified"}
+PRIVATE_FIELDS = {
+    "collections_opt_out",
+    "former_slugs",
+    "watermark_id",
+    "watermark_model",
+    "watermark_verified",
+}
 
 
 def _public_metadata(payload: dict) -> dict:
@@ -140,13 +153,76 @@ async def autocomplete(q: str):
     return {"suggestions": suggestions}
 
 
-@app.get("/image/{image_id}")
-async def get_image_by_id(image_id: str):
+# --- Photo addresses ---
+# A photo's address is its `slug`, made from its title like a collection's (see
+# core/gallery_collections.py); a title change gives it a new one and keeps the old ones in
+# `former_slugs`, which still lead to it. Picking an address and writing it happen under this
+# lock, so two photos with the same title saved at once cannot both get it.
+_slug_lock = asyncio.Lock()
+
+
+async def _photo_slug(title: str, except_id: Optional[str] = None) -> str:
+    """An address for a photo with this title that no other photo has or had."""
+    base = gc.slugify(title, fallback="photo")
+    slug = base
+    while gc.is_uuid(slug) or await qdrant_wrapper.slug_taken(slug, except_id):
+        slug = gc.with_suffix(base)
+    return slug
+
+
+async def _readdress_photo(image_id: str, payload: dict, title: str) -> dict:
+    """Payload keys that give a retitled photo the address of its new title, keeping the old one."""
+    slug = await _photo_slug(title, except_id=image_id)
+    former = gc.dedupe([*(payload.get("former_slugs") or []), payload.get("slug")])
+    return {"slug": slug, "former_slugs": [s for s in former if s != slug]}
+
+
+async def _find_photo(ref: str):
+    """A photo by its id, its address, or an address it had before its title changed."""
+    if gc.is_canonical_uuid(ref):
+        return await qdrant_wrapper.get_point(ref)
+    point = await qdrant_wrapper.find_point_by_slug(ref)
+    if point is None and ref != ref.lower():
+        point = await qdrant_wrapper.find_point_by_slug(ref.lower())
+    return point
+
+
+async def _backfill_photo_slugs() -> int:
+    """Give photos from before addresses existed theirs, in one pass over the payloads."""
+    async with _slug_lock:
+        points, offset = [], None
+        while True:
+            page, offset = await qdrant_wrapper.scroll(limit=500, offset=offset)
+            points.extend(page)
+            if offset is None:
+                break
+        taken = set()
+        for p in points:
+            payload = p.payload or {}
+            if payload.get("slug"):
+                taken.add(payload["slug"])
+            taken.update(payload.get("former_slugs") or [])
+        updates = {}
+        for p in points:
+            payload = p.payload or {}
+            if payload.get("slug"):
+                continue
+            slug = gc.unique_slug(gc.slugify(payload.get("title", ""), fallback="photo"), taken)
+            taken.add(slug)
+            updates[str(p.id)] = {"slug": slug, "former_slugs": payload.get("former_slugs") or []}
+        if updates:
+            await qdrant_wrapper.set_payloads(updates)
+        return len(updates)
+
+
+@app.get("/image/{ref}")
+async def get_image_by_id(ref: str):
     """
-    Get a single image detail by its ID.
+    Get a single image by its id or its address (`slug`), or an address it had before
+    its title changed. The response carries the current `slug` in `metadata`.
     """
     try:
-        point = await qdrant_wrapper.get_point(image_id)
+        point = await _find_photo(ref)
         if not point:
             raise HTTPException(status_code=404, detail="Image not found")
 
@@ -156,12 +232,12 @@ async def get_image_by_id(image_id: str):
             original_url=metadata.get("original_url", ""),
             score=1.0,  # Exact match by ID
             metadata=_public_metadata(metadata),
-            id=image_id,
+            id=str(point.id),
         )
     except Exception as e:
         if isinstance(e, HTTPException):
             raise e
-        print(f"Error fetching image {image_id}: {e}")
+        print(f"Error fetching image {ref}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -520,13 +596,15 @@ async def _ingest_bytes(
                 watermark_verified=watermark_verified,
             )
 
-        await qdrant_wrapper.upsert_point(
-            point_id=point_id,
-            image_dense_vector=dense_embedding,
-            text_dense_vector=text_dense_embedding,
-            sparse_vector=sparse_vec,
-            payload=payload,
-        )
+        async with _slug_lock:
+            payload.update(slug=await _photo_slug(title), former_slugs=[])
+            await qdrant_wrapper.upsert_point(
+                point_id=point_id,
+                image_dense_vector=dense_embedding,
+                text_dense_vector=text_dense_embedding,
+                sparse_vector=sparse_vec,
+                payload=payload,
+            )
 
         # 8. Add to Redis Pools for Waterfall Recommendation
         await redis_client.zadd("gallery:pool:active", {point_id: 0})
@@ -543,6 +621,7 @@ async def _ingest_bytes(
             "preview_url": r2_url_preview,
             "original_url": r2_url_original,
             "metadata_used_for_sparse": metadata_text,
+            "slug": payload["slug"],
             "collection_ids": membership["collection_ids"],
             "watermark": (
                 {"id": payload["watermark_id"], "verified": watermark_verified}
@@ -1009,12 +1088,21 @@ async def admin_update_image(
             if matched:
                 membership = gc.membership_payload(matched, by_admin=False)
         merged.update(membership)
-        await qdrant_wrapper.update_metadata(
-            point_id=image_id,
-            text_dense_vector=text_dense_embedding,
-            sparse_vector=sparse_vec,
-            payload={**changed, **membership},
-        )
+        async with _slug_lock:
+            # A new title is a new address (one that makes the same slug is not)
+            if "title" in changed and (
+                not payload.get("slug")
+                or gc.slugify(changed["title"], "photo") != gc.slugify(payload.get("title", ""), "photo")
+            ):
+                address = await _readdress_photo(image_id, payload, changed["title"])
+                changed.update(address)
+                merged.update(address)
+            await qdrant_wrapper.update_metadata(
+                point_id=image_id,
+                text_dense_vector=text_dense_embedding,
+                sparse_vector=sparse_vec,
+                payload={**changed, **membership},
+            )
     else:
         merged.update(membership)
         await qdrant_wrapper.set_membership({image_id: membership})

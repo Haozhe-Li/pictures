@@ -354,16 +354,24 @@ is run afterwards.
   `pending` means a rebuild is scheduled, `seconds_until_rebuild` is the time left until it starts
   (`null` when nothing is pending), `last_built_at` is epoch seconds (`null` before the first build).
 
-## 10. Get Image by ID
+## 10. Get Image by ID or Address
 
-Get details for a specific image by its UUID.
+Get details for a specific image by its UUID or its address.
 
-- **URL**: `GET /image/{image_id}`
+- **URL**: `GET /image/{ref}`
 - **Path Parameters**:
-  - `image_id` (string, required): The UUID of the image to retrieve.
+  - `ref` (string, required): the image's UUID, its `slug`, or a slug it had before its title changed
+    (percent-encode slugs with non-ASCII letters). A slug that is not found as given is tried in lower case.
+- **Addresses.** Like a collection (see *Addresses* in 12), each image has a `slug` made from its title, its
+  address on the site (`/?photo=summer-beach`). When another image has, or had, the same slug, a 4-character
+  random suffix is added (`summer-beach-k3x9`). A title change that makes a different slug gives the image a
+  new one; the old one stays in the payload's `former_slugs` (never in public responses) and still finds the
+  image. A title with nothing to keep gets `photo`. Ingest sets the slug (its response includes `slug`), and
+  on startup images without one get one.
 - **Response Example**:
   ```json
   {
+    "id": "uuid-string",
     "preview_url": "https://cdn.haozheli.com/uuid_preview.webp",
     "original_url": "https://cdn.haozheli.com/uuid_original.webp",
     "score": 1.0,
@@ -374,10 +382,12 @@ Get details for a specific image by its UUID.
       "camera": "Sony A7M4",
       "preview_url": "https://cdn.haozheli.com/uuid_preview.webp",
       "original_url": "https://cdn.haozheli.com/uuid_original.webp",
-      "type": "image"
+      "type": "image",
+      "slug": "summer-beach"
     }
   }
   ```
+- **Errors**: `404` nothing answers to `ref`.
 
 ## 11. Admin: Manage Images
 

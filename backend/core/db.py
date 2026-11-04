@@ -99,6 +99,17 @@ class QdrantClientWrapper:
         except Exception as e:
             print(f"Warning: could not ensure payload index on watermark_id: {e}")
 
+        # Photos are found by their address (and by the ones they had before a rename)
+        for field in ("slug", "former_slugs"):
+            try:
+                await self.client.create_payload_index(
+                    collection_name=settings.COLLECTION_NAME,
+                    field_name=field,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
+            except Exception as e:
+                print(f"Warning: could not ensure payload index on {field}: {e}")
+
         await self._init_gallery_collections()
 
     async def _init_gallery_collections(self):
@@ -592,6 +603,38 @@ class QdrantClientWrapper:
             with_vectors=False,
         )
         return points[0] if points else None
+
+    @staticmethod
+    def _slug_condition(key: str, slug: str) -> models.FieldCondition:
+        return models.FieldCondition(key=key, match=models.MatchValue(value=slug))
+
+    async def find_point_by_slug(self, slug: str):
+        """The photo at this address, else the one that had it before a rename; payload only."""
+        for key in ("slug", "former_slugs"):
+            points, _ = await self.client.scroll(
+                collection_name=settings.COLLECTION_NAME,
+                scroll_filter=models.Filter(must=[self._slug_condition(key, slug)]),
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if points:
+                return points[0]
+        return None
+
+    async def slug_taken(self, slug: str, except_id: Optional[str] = None) -> bool:
+        """Whether another photo has this address, now or from before a rename."""
+        points, _ = await self.client.scroll(
+            collection_name=settings.COLLECTION_NAME,
+            scroll_filter=models.Filter(
+                should=[self._slug_condition("slug", slug), self._slug_condition("former_slugs", slug)],
+                must_not=[models.HasIdCondition(has_id=[except_id])] if except_id else None,
+            ),
+            limit=1,
+            with_payload=False,
+            with_vectors=False,
+        )
+        return bool(points)
 
     async def get_point(self, point_id: str):
         """

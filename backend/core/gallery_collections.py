@@ -3,6 +3,7 @@ Pure helpers for collections: their addresses on the site, and membership.
 
 A collection's address is its `slug`, made from its title ("Formula 1" -> /collections/formula-1).
 A rename gives it a new one; the old ones are kept in `former_slugs` and still lead to it.
+Photos get their addresses the same way (/?photo=sunset-over-the-lake).
 
 An image's membership is two payload keys:
 
@@ -62,10 +63,11 @@ def _fold(ch: str) -> str:
     return plain if plain.isascii() else ch
 
 
-def slugify(title: str) -> str:
+def slugify(title: str, fallback: str = "collection") -> str:
     """
-    The readable part of a collection's address: its title in lower case with the words joined
-    by hyphens ("Formula 1" -> "formula-1"). Letters of other scripts are kept ("四川之夏").
+    The readable part of an address: the title in lower case with the words joined by
+    hyphens ("Formula 1" -> "formula-1"). Letters of other scripts are kept ("四川之夏").
+    `fallback` stands in for a title with nothing to keep.
     """
     text = "".join(_fold(ch) for ch in unicodedata.normalize("NFC", title)).lower()
     text = re.sub(r"['’]", "", text)  # "it's" -> "its", not "it-s"
@@ -76,7 +78,7 @@ def slugify(title: str) -> str:
         if slug[SLUG_MAX_LENGTH] != "-" and "-" in cut:
             cut = cut.rsplit("-", 1)[0]
         slug = cut.strip("-")
-    return slug or "collection"
+    return slug or fallback
 
 
 def is_uuid(value: str) -> bool:
@@ -92,11 +94,16 @@ def is_canonical_uuid(value: str) -> bool:
     return is_uuid(value) and str(uuid.UUID(value)) == value
 
 
+def with_suffix(base: str) -> str:
+    """`base` with a short random suffix, for when `base` is taken."""
+    return f"{base}-{''.join(random.choices(_SUFFIX_ALPHABET, k=4))}"
+
+
 def unique_slug(base: str, taken: Set[str]) -> str:
     """`base`, or `base` with a short random suffix when it is taken. Never a UUID (ids are)."""
     slug = base
     while slug in taken or is_uuid(slug):
-        slug = f"{base}-{''.join(random.choices(_SUFFIX_ALPHABET, k=4))}"
+        slug = with_suffix(base)
     return slug
 
 
